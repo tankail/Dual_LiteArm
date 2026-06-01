@@ -3,7 +3,7 @@
 ## 目录结构
 
 ```
-left_litearm/
+.
 ├── src/
 │   ├── litearm_config/           # MoveIt 配置与启动文件
 │   │   ├── config/               # URDF/Xacro、SRDF、控制器 YAML、RViz 配置
@@ -102,7 +102,7 @@ sudo usermod -a -G dialout $USER   # 如无权限，执行后重新登录
 ### 编译
 
 ```bash
-cd ~/left_litearm
+cd ~/Dual_LiteArm
 colcon build --packages-select litearm_config litearm_a10_251125 litearm_hardware litearm_robot
 source install/setup.bash
 ```
