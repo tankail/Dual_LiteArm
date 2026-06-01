@@ -1,0 +1,28 @@
+robot:
+  name: "LiteArm-A10-RightArm"
+  param_file: "litearm_right_arm_motors.yaml"
+
+joint_limits:
+  lower: [-2.4, -0.1, -0.1, -1.6, -1.7, -2.5, -1.0]
+  upper: [2.4, 3.2, 4.0, 1.6, 1.7, 2.5, 1.0]
+
+urdf:
+  file_path: "LiteArm_A10_251125.urdf"
+  base_link: "base_link"
+  end_effector_link: "r_joint7_link"
+
+kinematics:
+  joint_names:
+    - "r_joint1_joint"
+    - "r_joint2_joint"
+    - "r_joint3_joint"
+    - "r_joint4_joint"
+    - "r_joint5_joint"
+    - "r_joint6_joint"
+    - "r_joint7_joint"
+
+control:
+  default_velocity: 0.5
+  default_max_torque: 10.0
+  position_tolerance: 0.01
+  timeout: 10.0

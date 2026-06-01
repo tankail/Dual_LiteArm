@@ -1,0 +1,31 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: litearm_a10_251125
+    relative_path: urdf/LiteArm_A10_251125.urdf
+  srdf:
+    relative_path: config/LiteArm_A10_251125.srdf
+  package_settings:
+    author_name: LiteArm
+    author_email: 1532829466@qq.com
+    generated_timestamp: 1777259993
+  control_xacro:
+    command:
+      - position
+      - velocity
+      - effort
+    state:
+      - position
+      - velocity
+      - effort
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+      - velocity
+      - effort
+    state:
+      - position
+      - velocity
+      - effort

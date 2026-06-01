@@ -1,0 +1,11 @@
+# Default initial positions for LiteArm_A10_251125's ros2_control fake system (right arm only)
+
+initial_positions:
+  r_joint1_joint: 0
+  r_joint2_joint: 0
+  r_joint3_joint: 0
+  r_joint4_joint: 0
+  r_joint5_joint: 0
+  r_joint6_joint: 0
+  r_joint7_joint: 0
+  r_r_finger_joint: 0

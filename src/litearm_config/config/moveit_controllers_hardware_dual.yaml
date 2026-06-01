@@ -1,0 +1,45 @@
+# MoveIt controllers config for both left and right arms
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - left_arm_controller
+    - left_gripper_controller
+    - right_arm_controller
+    - right_gripper_controller
+
+  left_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    joints:
+      - l_joint1_joint
+      - l_joint2_joint
+      - l_joint3_joint
+      - l_joint4_joint
+      - l_joint5_joint
+      - l_joint6_joint
+      - l_joint7_joint
+
+  left_gripper_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    joints:
+      - l_r_finger_joint
+
+  right_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    joints:
+      - r_joint1_joint
+      - r_joint2_joint
+      - r_joint3_joint
+      - r_joint4_joint
+      - r_joint5_joint
+      - r_joint6_joint
+      - r_joint7_joint
+
+  right_gripper_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    joints:
+      - r_r_finger_joint

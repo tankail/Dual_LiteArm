@@ -1,0 +1,8 @@
+<library path="litearm_hardware">
+  <class name="litearm_hardware/LiteArmHardwareInterface" type="litearm_hardware::LiteArmHardwareInterface" base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Hardware interface for LiteArm A10 robotic arm with gripper.
+      Supports position control with configurable control modes (position_velocity or pd_control).
+    </description>
+  </class>
+</library>

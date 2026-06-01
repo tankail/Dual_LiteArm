@@ -1,0 +1,134 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <xacro:macro name="litearm_left_arm_hardware_ros2_control" params="name config_file control_mode">
+
+        <ros2_control name="${name}" type="system">
+            <hardware>
+                <plugin>litearm_hardware/LiteArmHardwareInterface</plugin>
+                <param name="config_file">${config_file}</param>
+                <param name="control_mode">${control_mode}</param>
+                <param name="gripper_rad_to_m">0.025</param>
+                <param name="gravity_compensation_urdf">$(find litearm_a10_251125)/urdf/LiteArm_A10_251125.urdf</param>
+                <param name="gravity_gain">0.85</param>
+            </hardware>
+
+            <!-- Joint 1 - Left Shoulder Roll (7256_35) -->
+            <joint name="l_joint1_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">72.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">300.0</param>
+                <param name="kd">10.0</param>
+                <param name="ki">50.0</param>
+            </joint>
+
+            <!-- Joint 2 - Left Shoulder Pitch (7256_35) -->
+            <joint name="l_joint2_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">72.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">300.0</param>
+                <param name="kd">10.0</param>
+                <param name="ki">50.0</param>
+            </joint>
+
+            <!-- Joint 3 - Left Elbow Pitch (6056_36) -->
+            <joint name="l_joint3_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">48.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">200.0</param>
+                <param name="kd">8.0</param>
+                <param name="ki">30.0</param>
+            </joint>
+
+            <!-- Joint 4 - Left Elbow Roll (6056_36) -->
+            <joint name="l_joint4_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">48.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">200.0</param>
+                <param name="kd">8.0</param>
+                <param name="ki">30.0</param>
+            </joint>
+
+            <!-- Joint 5 - Left Wrist Pitch (4438_30) -->
+            <joint name="l_joint5_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">20.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">60.0</param>
+                <param name="kd">3.0</param>
+                <param name="ki">10.0</param>
+            </joint>
+
+            <!-- Joint 6 - Left Wrist Roll (5047_36) -->
+            <joint name="l_joint6_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">36.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">100.0</param>
+                <param name="kd">5.0</param>
+                <param name="ki">20.0</param>
+            </joint>
+
+            <!-- Joint 7 - Left Wrist Pitch (4438_30) -->
+            <joint name="l_joint7_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">20.0</param>
+                <param name="max_velocity">1.0</param>
+                <param name="kp">60.0</param>
+                <param name="kd">3.0</param>
+                <param name="ki">10.0</param>
+            </joint>
+
+            <!-- Left Gripper (4438_30) -->
+            <joint name="l_r_finger_joint">
+                <command_interface name="position"/>
+                <command_interface name="velocity"/>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <param name="max_torque">10.0</param>
+                <param name="max_velocity">0.5</param>
+                <param name="kp">3.0</param>
+                <param name="kd">0.3</param>
+            </joint>
+
+            <joint name="l_l_finger_joint">
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+            </joint>
+
+        </ros2_control>
+    </xacro:macro>
+</robot>

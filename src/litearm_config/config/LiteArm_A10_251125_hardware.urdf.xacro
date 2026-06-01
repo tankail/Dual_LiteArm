@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="LiteArm_A10_251125_right_arm">
+
+  <!-- Arguments -->
+  <xacro:arg name="config_file" default=""/>
+  <xacro:arg name="control_mode" default="position_velocity"/>
+  <xacro:arg name="initial_positions_file" default="$(find litearm_config)/config/initial_positions.yaml"/>
+
+  <!-- Import robot description (links and joints) -->
+  <xacro:include filename="$(find litearm_a10_251125)/urdf/LiteArm_A10_251125.urdf" />
+
+  <!-- Import hardware ros2_control configuration -->
+  <xacro:include filename="$(find litearm_config)/config/LiteArm_A10_251125_hardware.ros2_control.xacro"/>
+
+  <!-- Instantiate ros2_control hardware interface for right arm only -->
+  <xacro:litearm_right_arm_hardware_ros2_control
+    name="LiteArmRightArmHardware"
+    config_file="$(arg config_file)"
+    control_mode="$(arg control_mode)"/>
+
+</robot>
