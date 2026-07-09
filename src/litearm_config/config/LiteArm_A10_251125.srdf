@@ -103,6 +103,15 @@
         <joint name="l_joint6_joint" value="0.0"/>
         <joint name="l_joint7_joint" value="0.0"/>
     </group_state>
+    <group_state name="pose5" group="left_arm">
+        <joint name="l_joint1_joint" value="-0.279253"/>
+        <joint name="l_joint2_joint" value="-0.087266"/>
+        <joint name="l_joint3_joint" value="0.174533"/>
+        <joint name="l_joint4_joint" value="-1.343904"/>
+        <joint name="l_joint5_joint" value="0.383972"/>
+        <joint name="l_joint6_joint" value="0.034907"/>
+        <joint name="l_joint7_joint" value="-0.593412"/>
+    </group_state>
     <group_state name="home" group="right_arm">
         <joint name="r_joint1_joint" value="0"/>
         <joint name="r_joint2_joint" value="0"/>

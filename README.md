@@ -230,6 +230,7 @@ ros2 topic echo /joint_states --field position
 | `pose2` | left_arm | (-38, 1, 15, -70, -3, -2, -18) |
 | `pose3` | left_arm | (-30, 8, 15, -94, 10, -2.5, 30) |
 | `pose4` | left_arm | (-90, 0, 0, 0, 0, 0, 0) |
+| `pose5` | left_arm | (-16, -5, 10, -77, 22, 2, -34) |
 
 姿态定义在 `config/LiteArm_A10_251125.srdf` 中，单位为弧度。
 
@@ -319,3 +320,88 @@ sudo usermod -a -G dialout $USER  # 重新登录后生效
 
 - kp 过大 → 在 xacro 中降低对应关节的 kp
 - kd 过小 → 适当增大 kd（约 kp * 0.03 ~ 0.05）
+
+---
+
+## 示教程序 (Teach & Playback)
+
+纯 Python 串口直驱示教工具，位于 `src/litearm_robot/teach/`，不依赖 ROS2，直接用串口协议控制电机。
+
+### 串口与全局ID映射
+
+| 机械臂 | 串口 | serial_id | 本地电机ID | 全局ID |
+|--------|------|:---:|------------|:---:|
+| 右臂   | /dev/ttyACM0 | 1 | 1-8 | 1-8 |
+| 左臂   | /dev/ttyACM1 | 2 | 1-8 | 9-16 |
+
+### 文件说明
+
+| 文件 | 用途 |
+|------|------|
+| `motor_driver.py` | 电机串口协议驱动库（Livelybot 协议），提供 `MultiMotorManager` 多端口管理 |
+| `teach_record.py` | 示教录制 — 电机进入自由模式，手动拖动，记录关节轨迹 |
+| `teach_playback.py` | 轨迹回放 — ping-pong 循环播放录制的轨迹 |
+| `merge_traj.py` | 轨迹合并工具 — 将两条独立轨迹按时间轴合并 |
+
+### 轨迹格式
+
+`.jsonl` 文件，每行一个 JSON 对象：
+```json
+{"t": 0.0, "pos_1": 0.5, "vel_1": 0.0, "pos_2": -0.3, "vel_2": 0.0, ...}
+```
+
+- `t` — 时间戳（秒）
+- `pos_N` — 全局电机 N 的位置（弧度）
+- `vel_N` — 全局电机 N 的速度（弧度/秒）
+
+### 使用示例
+
+```bash
+# 录制双臂示教轨迹
+cd src/litearm_robot/teach
+python3 teach_record.py
+
+# 录制时可指定输出文件和频率
+python3 teach_record.py --output my_dance.jsonl --rate 50
+
+# 软保持模式 (kp=20)，手臂可拖动但不完全塌
+python3 teach_record.py --hold 20 --hold_kd 2.0
+
+# 回放轨迹 (ping-pong 循环)
+python3 teach_playback.py trajectory_xxx.jsonl
+
+# 调节回放增益和速度
+python3 teach_playback.py trajectory_xxx.jsonl --kp 5.0 --kd 0.5 --speed 1.5 --loop 3
+
+# 合并两条轨迹
+python3 merge_traj.py body_traj.jsonl head_traj.jsonl merged.jsonl
+```
+
+### 自定串口/电机
+
+如果手臂接了不同端口，用 `--ports` 和 `--motor_ids` 覆盖：
+
+```bash
+# 仅右臂
+python3 teach_record.py --ports /dev/ttyACM0 --motor_ids "1,2,3,4,5,6,7,8"
+
+# 仅左臂
+python3 teach_record.py --ports /dev/ttyACM1 --motor_ids "1,2,3,4,5,6,7,8"
+
+# 自定义映射 (右臂ACM2, 左臂ACM0)
+python3 teach_record.py --ports /dev/ttyACM2,/dev/ttyACM0 \
+    --motor_ids "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8"
+```
+
+### 依赖
+
+```bash
+pip install pyserial
+```
+
+### 注意事项
+
+- **不能和 ros2_control 同时使用** — 示教程序直接占用串口，与 ROS2 hardware plugin 互斥
+- 录制前电机会进入自由模式（kp=kd=0），手臂会因重力下坠，请用手扶住
+- 使用 `--hold` 参数可启用软保持，利用当前姿态 + 小增益抵消部分重力
+- 端口权限不足时执行：`sudo usermod -a -G dialout $USER`

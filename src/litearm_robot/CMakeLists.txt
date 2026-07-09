@@ -156,6 +156,10 @@ if(pinocchio_FOUND)
   add_executable(dual_arm_joint_angle examples/dual_arm_joint_angle.cpp)
   target_link_libraries(dual_arm_joint_angle litearm_robot ament_index_cpp::ament_index_cpp)
 
+  message(STATUS "Building dual_arm_aging_test_custom example")
+  add_executable(dual_arm_aging_test_custom examples/dual_arm_aging_test_custom.cpp)
+  target_link_libraries(dual_arm_aging_test_custom litearm_robot ament_index_cpp::ament_index_cpp)
+
   # Install gravity compensation executables
   install(TARGETS
       right_arm_gravity_compensation
@@ -166,6 +170,7 @@ if(pinocchio_FOUND)
       dual_arm_aging_test
       dual_arm_aging_test111
       dual_arm_joint_angle
+      dual_arm_aging_test_custom
       RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 else()
