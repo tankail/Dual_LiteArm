@@ -65,7 +65,7 @@ kp/kd 配置在 `config/LiteArm_A10_251125_hardware.ros2_control.xacro`（右臂
 
 ### 设备与 serial_id 映射
 
-硬件插件通过 `robot_param/litearm_*_motors.yaml` 中的 `serial_id` 来确定使用哪个 `/dev/ttyACM` 设备（`serial_id` 为 1-based 索引）：
+硬件插件通过 `robot_param/litearm_*_motors.yaml` 中的 `serial_id` 来确定使用哪个 `/dev/ttyACM` 设备。SDK 会先按设备编号升序扫描 `/dev/ttyACM*`，再用 `serial_id` 作为 1-based 索引：
 
 ```yaml
 robot:
@@ -75,15 +75,17 @@ robot:
     No_1_CANboard:
       CANport:
         CANport_1:
-          serial_id: <N>   # 索引到第 N 个 /dev/ttyACM 设备
+          serial_id: <N>   # 1 => /dev/ttyACM0, 2 => /dev/ttyACM1, ...
 ```
 
-| 机械臂 | serial_id | 对应端口 |
-|--------|-----------|----------|
-| 右臂   | 1         | /dev/ttyACM0 |
-| 左臂   | 2         | /dev/ttyACM1 |
+| 部件 | serial_id | 对应端口 | 当前配置文件 |
+|------|:---:|----------|--------------|
+| 左臂 | 1 | `/dev/ttyACM0` | `robot_param/litearm_left_arm_motors.yaml` |
+| 右臂 | 2 | `/dev/ttyACM1` | `robot_param/litearm_right_arm_motors.yaml` |
+| 腰部 | 3 | `/dev/ttyACM2` | 示教程序默认映射 |
+| 头部 | 4 | `/dev/ttyACM3` | 示教程序默认映射 |
 
-> **注意**：`serial_id` 值不能为 0；映射关系由 SDK 的 `robot.cpp:415`（`str[serial_id-1]`）决定。
+> **注意**：`serial_id` 值不能为 0；映射关系由 SDK `robot.cpp` 的 `init_ser()` 中 `str[serial_id-1]` 决定。左臂重力补偿专用配置文件为 `robot_param/litearm_left_arm_ttyACM0.yaml`，对应电机文件为 `robot_param/litearm_left_arm_ttyACM0_motors.yaml`。
 
 ### 验证串口连接
 
@@ -329,10 +331,12 @@ sudo usermod -a -G dialout $USER  # 重新登录后生效
 
 ### 串口与全局ID映射
 
-| 机械臂 | 串口 | serial_id | 本地电机ID | 全局ID |
-|--------|------|:---:|------------|:---:|
-| 右臂   | /dev/ttyACM0 | 1 | 1-8 | 1-8 |
-| 左臂   | /dev/ttyACM1 | 2 | 1-8 | 9-16 |
+| 部件 | 串口 | serial_id | 本地电机ID | 全局ID |
+|------|------|:---:|------------|:---:|
+| 左臂 | `/dev/ttyACM0` | 1 | 1-8 | 1-8 |
+| 右臂 | `/dev/ttyACM1` | 2 | 1-8 | 9-16 |
+| 腰部 | `/dev/ttyACM2` | 3 | 1-2 | 17-18 |
+| 头部 | `/dev/ttyACM3` | 4 | 1-2 | 19-20 |
 
 ### 文件说明
 
@@ -357,7 +361,7 @@ sudo usermod -a -G dialout $USER  # 重新登录后生效
 ### 使用示例
 
 ```bash
-# 录制双臂示教轨迹
+# 录制双臂 + 腰部 + 头部示教轨迹
 cd src/litearm_robot/teach
 python3 teach_record.py
 
@@ -382,13 +386,17 @@ python3 merge_traj.py body_traj.jsonl head_traj.jsonl merged.jsonl
 如果手臂接了不同端口，用 `--ports` 和 `--motor_ids` 覆盖：
 
 ```bash
-# 仅右臂
+# 仅左臂
 python3 teach_record.py --ports /dev/ttyACM0 --motor_ids "1,2,3,4,5,6,7,8"
 
-# 仅左臂
+# 仅右臂
 python3 teach_record.py --ports /dev/ttyACM1 --motor_ids "1,2,3,4,5,6,7,8"
 
-# 自定义映射 (右臂ACM2, 左臂ACM0)
+# 自定义映射 (左臂ACM0, 右臂ACM1, 腰部ACM2, 头部ACM3)
+python3 teach_record.py --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2,/dev/ttyACM3 \
+    --motor_ids "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8;1,2;1,2"
+
+# 自定义映射 (左臂ACM2, 右臂ACM0)
 python3 teach_record.py --ports /dev/ttyACM2,/dev/ttyACM0 \
     --motor_ids "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8"
 ```

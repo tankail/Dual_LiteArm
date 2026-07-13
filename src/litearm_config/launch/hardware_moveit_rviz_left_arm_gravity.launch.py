@@ -14,7 +14,7 @@ def generate_launch_description():
     default_config_file = PathJoinSubstitution([
         litearm_config_path,
         'robot_param',
-        'litearm_left_arm_ttyACM1.yaml'
+        'litearm_left_arm_ttyACM0.yaml'
     ])
 
     config_file_arg = DeclareLaunchArgument(

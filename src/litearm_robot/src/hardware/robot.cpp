@@ -5,6 +5,8 @@
 #include <yaml-cpp/yaml.h>
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
+#include <limits>
 
 namespace hightorque_robot
 {
@@ -378,7 +380,24 @@ namespace hightorque_robot
 
         closedir(directory);
 
-        std::reverse(serial_ports.begin(), serial_ports.end());
+        auto suffix_number = [&prefix](const std::string& path) {
+            const std::string name = path.substr(path.rfind('/') + 1);
+            const std::string suffix = name.substr(prefix.size());
+            char *end = nullptr;
+            const long value = std::strtol(suffix.c_str(), &end, 10);
+            if (suffix.empty() || *end != '\0')
+            {
+                return std::numeric_limits<long>::max();
+            }
+            return value;
+        };
+
+        std::sort(serial_ports.begin(), serial_ports.end(),
+            [&suffix_number](const std::string& a, const std::string& b) {
+                const long a_num = suffix_number(a);
+                const long b_num = suffix_number(b);
+                return a_num == b_num ? a < b : a_num < b_num;
+            });
 
         return serial_ports;
     }

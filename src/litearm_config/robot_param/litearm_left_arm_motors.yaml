@@ -1,6 +1,6 @@
 robot:
   robot_name: "LiteArm-A10-LeftArm"
-  Serial_Type: "/dev/ttyACM"
+  Serial_Type: "/dev/ttyACM"  # numeric scan: serial_id 1 => /dev/ttyACM0
   Seial_baudrate: 4000000
   motor_timeout_ms: 0
   canport_error_output_flag: false
@@ -12,7 +12,7 @@ robot:
       CANport_num: 1
       CANport:
         CANport_1:
-          serial_id: 1
+          serial_id: 1  # /dev/ttyACM0, left arm
           motor_num: 8
           motor:
             motor1:
