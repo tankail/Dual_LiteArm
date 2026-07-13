@@ -15,9 +15,11 @@
     --speed 1.0    播放速度倍率
     --loop 0       循环次数 (0=无限)
 
-默认配置 (双臂):
-    /dev/ttyACM0 → 右手臂 8电机 (全局ID 1-8)
-    /dev/ttyACM1 → 左手臂 8电机 (全局ID 9-16)
+默认配置 (双臂+腰+头):
+    /dev/ttyACM0 → 左手臂 8电机 (全局ID 1-8)
+    /dev/ttyACM1 → 右手臂 8电机 (全局ID 9-16)
+    /dev/ttyACM2 → 腰部    2电机 (全局ID 17-18)
+    /dev/ttyACM3 → 头部    2电机 (全局ID 19-20)
 """
 
 import sys
@@ -27,9 +29,9 @@ import argparse
 import signal
 from motor_driver import MultiMotorManager, rad_to_deg
 
-# 默认端口与电机ID配置 (双臂: 右臂ACM0 + 左臂ACM1)
-DEFAULT_PORTS = "/dev/ttyACM0,/dev/ttyACM1"
-DEFAULT_MOTOR_IDS = "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8"
+# 默认端口与电机ID配置 (左臂ACM0 + 右臂ACM1 + 腰部ACM2 + 头部ACM3)
+DEFAULT_PORTS = "/dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2,/dev/ttyACM3"
+DEFAULT_MOTOR_IDS = "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8;1,2;1,2"
 
 
 def parse_motor_config(ports_str, ids_str):
@@ -66,10 +68,10 @@ def detect_active_motors(records, global_ids):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="示教轨迹循环回放 (双臂, 来回跑)")
+    parser = argparse.ArgumentParser(description="示教轨迹循环回放 (双臂+腰+头, 来回跑)")
     parser.add_argument("trajectory", help="轨迹JSONL文件")
     parser.add_argument("--ports", default=DEFAULT_PORTS,
-                        help="串口列表, 逗号分隔 (默认: /dev/ttyACM0,/dev/ttyACM1)")
+                        help="串口列表, 逗号分隔 (默认: /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2,/dev/ttyACM3)")
     parser.add_argument("--motor_ids", default=DEFAULT_MOTOR_IDS,
                         help="每端口电机ID, 分号分隔各端口, 逗号分隔端口内电机")
     parser.add_argument("--loop", type=int, default=0, help="循环次数 (0=无限)")
@@ -95,7 +97,7 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("示教轨迹循环回放 (双臂, ping-pong)")
+    print("示教轨迹循环回放 (双臂+腰+头, ping-pong)")
     print("=" * 60)
     print(f"  轨迹文件: {args.trajectory}")
     print(f"  帧数: {N},  总时长: {records[-1]['t']:.2f}s,  帧间隔: {avg_dt*1000:.1f}ms")

@@ -1,3 +1,4 @@
 log/
 install/
 build/
+src/litearm_robot/teach/trajectory_*

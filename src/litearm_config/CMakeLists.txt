@@ -20,6 +20,5 @@ install(FILES .setup_assistant DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/aging_test.py
   scripts/joint_angle_monitor.py
-  scripts/left_arm_pose5.py
   DESTINATION lib/${PROJECT_NAME}
 )

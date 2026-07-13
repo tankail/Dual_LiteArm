@@ -9,9 +9,11 @@
     python3 teach_record.py
     python3 teach_record.py --output my_traj.jsonl --rate 50
 
-默认配置 (双臂):
-    /dev/ttyACM0 → 右手臂 8电机 (全局ID 1-8)
-    /dev/ttyACM1 → 左手臂 8电机 (全局ID 9-16)
+默认配置 (双臂+腰+头):
+    /dev/ttyACM0 → 左手臂 8电机 (全局ID 1-8)
+    /dev/ttyACM1 → 右手臂 8电机 (全局ID 9-16)
+    /dev/ttyACM2 → 腰部    2电机 (全局ID 17-18)
+    /dev/ttyACM3 → 头部    2电机 (全局ID 19-20)
 """
 
 import sys
@@ -22,9 +24,9 @@ import signal
 from datetime import datetime
 from motor_driver import MultiMotorManager, rad_to_deg
 
-# 默认端口与电机ID配置 (双臂: 右臂ACM0 + 左臂ACM1)
-DEFAULT_PORTS = "/dev/ttyACM0,/dev/ttyACM1"
-DEFAULT_MOTOR_IDS = "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8"
+# 默认端口与电机ID配置 (左臂ACM0 + 右臂ACM1 + 腰部ACM2 + 头部ACM3)
+DEFAULT_PORTS = "/dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2,/dev/ttyACM3"
+DEFAULT_MOTOR_IDS = "1,2,3,4,5,6,7,8;1,2,3,4,5,6,7,8;1,2;1,2"
 
 
 def parse_motor_config(ports_str, ids_str):
@@ -43,7 +45,7 @@ def parse_motor_config(ports_str, ids_str):
 def main():
     parser = argparse.ArgumentParser(description="示教轨迹录制")
     parser.add_argument("--ports", default=DEFAULT_PORTS,
-                        help="串口列表, 逗号分隔 (默认: /dev/ttyACM0,/dev/ttyACM1)")
+                        help="串口列表, 逗号分隔 (默认: /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2,/dev/ttyACM3)")
     parser.add_argument("--motor_ids", default=DEFAULT_MOTOR_IDS,
                         help="每端口电机ID, 分号分隔各端口, 逗号分隔端口内电机")
     parser.add_argument("--output", default=None,
@@ -69,7 +71,7 @@ def main():
     total = mgr.total_motors
 
     print("=" * 60)
-    print("示教轨迹录制 (双臂)")
+    print("示教轨迹录制 (双臂+腰+头)")
     print("=" * 60)
     for port, ids in port_motor_map.items():
         print(f"  {port} → {len(ids)}个电机 (本地ID: {ids})")

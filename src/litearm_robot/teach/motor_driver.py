@@ -4,8 +4,10 @@ Livelybot 电机串口协议驱动 (纯Python)
 协议参考: Panthera-HT_SDK / left_litearm 源码
 
 支持多端口多电机, 全局ID自动编排:
-  /dev/ttyACM0: 右手臂 8电机 → 全局ID 1-8
-  /dev/ttyACM1: 左手臂 8电机 → 全局ID 9-16
+  /dev/ttyACM0: 左手臂 8电机 → 全局ID 1-8
+  /dev/ttyACM1: 右手臂 8电机 → 全局ID 9-16
+  /dev/ttyACM2: 腰部    2电机 → 全局ID 17-18
+  /dev/ttyACM3: 头部    2电机 → 全局ID 19-20
 """
 
 import struct
@@ -163,7 +165,11 @@ class MotorDriver:
 
         if self._board_version >= _ver(4,1,0):
             print(f"  {self.port}: Step2 FDCAN_RESET...")
-            self._send_raw(MODE_FDCAN_RESET, b'\x7F'); time.sleep(0.01)
+            # 与C++对齐: 连发3次确保FDCAN总线可靠复位
+            self._send_raw(MODE_FDCAN_RESET, b'\x7F')
+            self._send_raw(MODE_FDCAN_RESET, b'\x7F')
+            self._send_raw(MODE_FDCAN_RESET, b'\x7F')
+            time.sleep(0.1)  # 等待FDCAN总线重新枚举电机
 
         if self._board_version:
             print(f"  {self.port}: Step3 检测电机固件版本...")
@@ -355,10 +361,12 @@ class MultiMotorManager:
 
     用法:
         mgr = MultiMotorManager({
-            "/dev/ttyACM0": [1,2,3,4,5,6,7,8],   # 右手臂
-            "/dev/ttyACM1": [1,2,3,4,5,6,7,8],   # 左手臂
+            "/dev/ttyACM0": [1,2,3,4,5,6,7,8],   # 左手臂
+            "/dev/ttyACM1": [1,2,3,4,5,6,7,8],   # 右手臂
+            "/dev/ttyACM2": [1,2],                # 腰部
+            "/dev/ttyACM3": [1,2],                # 头部
         })
-        # 全局ID自动编排: ACM0→1-8 (右臂), ACM1→9-16 (左臂)
+        # 全局ID自动编排: ACM0→1-8 (左臂), ACM1→9-16 (右臂), ACM2→17-18 (腰), ACM3→19-20 (头)
     """
 
     def __init__(self, port_motor_map: dict):

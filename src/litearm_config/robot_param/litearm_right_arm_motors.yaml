@@ -12,7 +12,7 @@ robot:
       CANport_num: 1
       CANport:
         CANport_1:
-          serial_id: 1
+          serial_id: 2
           motor_num: 8
           motor:
             motor1:
