@@ -132,6 +132,10 @@ if(pinocchio_FOUND)
   add_executable(left_arm_gravity_compensation examples/left_arm_gravity_compensation.cpp)
   target_link_libraries(left_arm_gravity_compensation litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
 
+  message(STATUS "Building left_arm_teleop_force_feedback_dob example")
+  add_executable(left_arm_teleop_force_feedback_dob examples/left_arm_teleop_force_feedback_dob.cpp)
+  target_link_libraries(left_arm_teleop_force_feedback_dob litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
+
   message(STATUS "Building right_arm_gravity_calc example (diagnostic only)")
   add_executable(right_arm_gravity_calc examples/right_arm_gravity_calc.cpp)
   target_link_libraries(right_arm_gravity_calc litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
@@ -163,6 +167,7 @@ if(pinocchio_FOUND)
       right_arm_gravity_calc
       left_arm_gravity_compensation
       left_arm_gravity_calc
+      left_arm_teleop_force_feedback_dob
       left_arm_joint_angle
       dual_arm_aging_test
       dual_arm_aging_test111

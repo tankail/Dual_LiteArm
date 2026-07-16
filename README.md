@@ -34,11 +34,13 @@
 | `examples/dual_arm_aging_test.cpp` | 双臂老化循环测试 |
 | `examples/left_arm_gravity_compensation.cpp` | 左臂纯重力补偿（Pinocchio RNEA） |
 | `examples/right_arm_gravity_compensation.cpp` | 右臂纯重力补偿（Pinocchio RNEA） |
+| `examples/left_arm_teleop_force_feedback_dob.cpp` | 左臂 DOB 力反馈主从遥操（见下方专门章节） |
 | `config/ros2_controllers_hardware_dual.yaml` | 双臂 ros2_control 控制器配置 |
 | `config/moveit_controllers_hardware_dual.yaml` | 双臂 MoveIt 控制器映射 |
 | `config/LiteArm_A10_251125.srdf` | MoveIt 语义描述（Planning Group、命名姿态） |
 | `robot_param/litearm_left_arm_motors.yaml` | 左臂电机型号与串口配置 |
 | `robot_param/litearm_right_arm_motors.yaml` | 右臂电机型号与串口配置 |
+| `robot_param/litearm_left_arm_follower.yaml` | 遥操从臂（左臂×2 场景，/dev/ttyACM1） |
 
 ---
 
@@ -322,6 +324,87 @@ sudo usermod -a -G dialout $USER  # 重新登录后生效
 
 - kp 过大 → 在 xacro 中降低对应关节的 kp
 - kd 过小 → 适当增大 kd（约 kp * 0.03 ~ 0.05）
+
+---
+
+## DOB 力反馈主从遥操（左臂 × 2）
+
+七轴广义动量扰动观测器（DOB）力反馈主从遥操 + 夹爪直接力矩映射。
+源码：`src/litearm_robot/examples/left_arm_teleop_force_feedback_dob.cpp`（移植自 Panthera SDK 的 `5_teleop_control_force_feedback_dob.py`）。
+
+### 硬件接线
+
+| 角色 | 硬件 | 串口 | 配置文件 |
+|------|------|------|----------|
+| 主臂 (Leader) | 左臂 | `/dev/ttyACM0` (serial_id=1) | `robot_param/litearm_left_arm.yaml` |
+| 从臂 (Follower) | 左臂 | `/dev/ttyACM1` (serial_id=2) | `robot_param/litearm_left_arm_follower.yaml` |
+
+> 与 ros2_control / 示教程序互斥，不能同时占用串口。
+
+### 工作原理
+
+```
+主臂: 重力补偿 G(q) + 摩擦前馈 + 力反馈 - 阻尼      (纯力矩模式, kp=kd=0, 可自由拖动)
+从臂: MIT 位置跟踪主臂 (kp/kd) + 重力/摩擦前馈
+
+从臂侧 DOB (广义动量观测器, Pinocchio M/C/G):
+  p = M(q)·v
+  ṗ = τ_motor - (G + τ_f - Cᵀv) + τ_ext
+  r = K_obs·(p - ∫(ṗ_nominal + r)dt)   →  τ_ext 估计
+反馈链路: τ_ext → 增益(默认1.0, 1:1) → 限幅 → 斜率限制 → 主臂
+
+夹爪 (第8个电机): 不用 DOB
+  从臂夹爪实测力矩(扣静态偏置) × 增益 × 符号 → 主臂夹爪
+  主臂夹爪位置 → 从臂夹爪位置 (kp 跟踪)
+```
+
+### 启动
+
+```bash
+source install/setup.bash
+ros2 run litearm_robot left_arm_teleop_force_feedback_dob
+
+# 完整参数: <leader.yaml> <follower.yaml> <urdf> <手臂反馈增益> <夹爪反馈增益>
+ros2 run litearm_robot left_arm_teleop_force_feedback_dob '' '' '' 0.7 1.0
+```
+
+启动流程（约 6 秒）：**观测器预热(1s) → 从臂同步(3s) → 静态校准(1s) → 力反馈渐入(1s)**。
+启动期间保持双臂无接触，屏幕显示 `力反馈 100%` 后再操作。按 Ctrl+C 停机（电机掉电，注意扶好手臂）。
+
+### 输出解读
+
+```
+力反馈 100%  频率=200.0Hz  误差=0.023rad  DOB=[...]  反馈=[...]  重置=0  夹爪主/从=0.05/0.03 测量=0.01 反馈=-0.01Nm
+```
+
+- `DOB` — 从臂各关节外力矩估计 (Nm)；`反馈` — 实际叠加到主臂的力矩
+- `重置` — DOB 发散重置计数，频繁增加说明模型误差大或 `DOB_RESET_LIMIT` 太小
+- `误差=J<n>` — 当前跟踪误差最大的关节及数值，用于定位不跟随的关节
+- `夹爪主/从` — 两侧夹爪位置，用于确认夹爪跟随
+
+### 调参（文件顶部常量，改后需重新编译）
+
+| 常量 | 默认值 | 说明 |
+|------|--------|------|
+| `DEFAULT_FEEDBACK_GAIN` | 1.0 | 手臂力反馈增益，1.0 = 外力 1:1 映射（argv[4]，范围 [0,1.5]） |
+| `GRIPPER_FEEDBACK_GAIN` | 1.0 | 夹爪力矩映射增益（argv[5]） |
+| `GRIPPER_FEEDBACK_SIGN` | -1.0 | 夹爪反馈方向，捏爪时感觉"助力"而非"阻力"则改 +1.0 |
+| `FOLLOWER_KP` / `KD` | {20,25,25,15,5,8,4} | 从臂跟踪刚度，跟踪软加大 kp、抖动加大 kd |
+| `MAX_TRACKING_ERROR` | {0.3,0.3,0.3,0.3,0.4,0.4,0.4} | 从臂跟踪误差饱和 (rad)，限制 kp×误差堵转力矩，防电机过流保护 |
+| `GRIPPER_MAX_TRACKING_ERROR` | 0.4 | 夹爪误差饱和，主爪拉超从爪机械行程时防堵转掉线 |
+| `COULOMB_FRICTION` | {0.10,...} | **待标定**。未标定时自由移动主臂有拖拽感（伪扰动） |
+| `FEEDBACK_TORQUE_LIMIT` | {8,12,12,8,3,3,2} | 主臂反馈限幅，只做异常保护，不应日常饱和 |
+| `DOB_RESET_LIMIT` | {30,50,50,30,12,12,8} | DOB 发散重置阈值，需大于正常接触力矩 |
+| `GRAVITY_GAIN` | {0.85,1,1,0.8,1,1,1} | 重力补偿增益（与重力补偿例程一致） |
+
+**摩擦标定方法**：跑起来后在自由空间匀速缓慢转动主臂某个关节（从臂无接触），读打印中该关节 DOB 稳态值，填入 `COULOMB_FRICTION` 对应项（宁小勿大），重编后伪扰动即消除。J1（7256 大减速比）摩擦明显偏大，优先标定。
+
+### 安全注意
+
+- 从臂目标**直接映射**主臂位置，不做关节限位夹紧（两臂同构，主臂物理行程即从臂行程）；`litearm_left_arm_follower.yaml` 的 `joint_limits` 放宽为 ±5，仅作 SDK 兜底
+- 跟踪误差饱和（`MAX_TRACKING_ERROR`）限制的是瞬时拉扯力矩，不限制可到达位置——从臂始终会走到主臂所在位置
+- 所有反馈经限幅 + 斜率限制 + DOB 发散重置三层保护，但首次调参建议低增益（0.15~0.35）起步
+- 异常退出（含 Ctrl+C）时电机自动刹车/掉电，请扶住手臂
 
 ---
 

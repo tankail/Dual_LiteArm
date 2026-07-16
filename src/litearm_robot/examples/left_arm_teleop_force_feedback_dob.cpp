@@ -87,7 +87,11 @@ const Eigen::VectorXd MASTER_DAMPING = makeVec({0.12, 0.20, 0.20, 0.08, 0.04, 0.
 // 重力补偿力矩增益系数（与 left_arm_gravity_compensation 一致，主从臂共用）
 const Eigen::VectorXd GRAVITY_GAIN = makeVec({0.85, 1.0, 1.0, 0.8, 1.0, 1.0, 1.0});
 
-const double JOINT_LIMIT_MARGIN = 0.002;            // 从臂目标限位内缩 (rad)
+// 从臂跟踪误差饱和 (rad)：目标位置不超过当前位置 ±该值，
+// 限制 kp*(target-pos) 的最大堵转力矩（如 J2: 25*0.3=7.5Nm），
+// 防止从臂被卡住/主臂快速甩动时电机持续大力矩堵转触发过流过热保护。
+// 注意：这不限制从臂可到达的位置——从臂会持续向主臂位置移动直至完全到位
+const Eigen::VectorXd MAX_TRACKING_ERROR = makeVec({0.3, 0.3, 0.3, 0.3, 0.4, 0.4, 0.4});
 
 // ---------- 夹爪（第 8 个电机, 4438_30）：位置直接映射 + 力矩直接反馈，不用 DOB ----------
 const double GRIPPER_KP = 6.0;
@@ -101,6 +105,9 @@ const double GRIPPER_DIRECT_FEEDBACK_RATE_LIMIT = 30.0;  // Nm/s
 const double GRIPPER_FEEDBACK_SIGN = -1.0;          // 方向不对时改成 +1.0
 const double GRIPPER_POS_LOWER = -3.0;              // 夹爪目标安全限幅 (rad)，不截断正常行程
 const double GRIPPER_POS_UPPER = 3.0;
+// 夹爪跟踪误差饱和 (rad)：主爪拉超从爪机械行程时，限制堵转力矩 kp*0.4=2.4Nm，
+// 防止 4438 电机堵转过流保护掉线
+const double GRIPPER_MAX_TRACKING_ERROR = 0.4;
 
 // ---------- 频率 / 时序 ----------
 const double CONTROL_RATE_HZ = 200.0;               // 与重力补偿例程一致
@@ -376,15 +383,8 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        // 从臂关节限位
-        std::vector<double> lim_lower_std, lim_upper_std;
-        follower.getJointLimits(lim_lower_std, lim_upper_std);
-        if ((int)lim_lower_std.size() < n || (int)lim_upper_std.size() < n) {
-            std::cerr << "错误: 从臂关节限位配置不足 " << n << " 个" << std::endl;
-            return 1;
-        }
-        Eigen::VectorXd safe_lower = toEigen(lim_lower_std).head(n).array() + JOINT_LIMIT_MARGIN;
-        Eigen::VectorXd safe_upper = toEigen(lim_upper_std).head(n).array() - JOINT_LIMIT_MARGIN;
+        // 注：从臂目标直接映射主臂位置，不做关节限位夹紧——
+        // 主从为同构左臂，主臂物理可达的位置从臂同样可达
 
         // 观测器 / 滤波器 / 偏置
         MomentumDisturbanceObserver observer(DOB_CUTOFF_HZ);
@@ -562,22 +562,12 @@ int main(int argc, char** argv)
                 + phase.sync_activation * leader_pos;
             Eigen::VectorXd follower_target_vel = phase.sync_activation * leader_vel;
 
-            // 目标夹紧到从臂限位内侧，并阻止继续向限位外运动
-            Eigen::VectorXd limited_pos =
-                follower_target_pos.cwiseMax(safe_lower).cwiseMin(safe_upper);
-            int limited_joint_count = 0;
-            for (int i = 0; i < n; ++i) {
-                bool limited = (limited_pos[i] != follower_target_pos[i]);
-                bool outward = (follower_target_pos[i] <= safe_lower[i] && follower_target_vel[i] < 0.0)
-                    || (follower_target_pos[i] >= safe_upper[i] && follower_target_vel[i] > 0.0);
-                if (outward) {
-                    follower_target_vel[i] = 0.0;
-                }
-                if (limited || outward) {
-                    limited_joint_count++;
-                }
-            }
-            follower_target_pos = limited_pos;
+            // 跟踪误差饱和：目标不超出从臂当前位置 ±MAX_TRACKING_ERROR，
+            // 限制电机内部 kp*(target-pos) 的最大力矩，防止堵转过流。
+            // 不做关节限位夹紧，主臂位置直接映射到从臂
+            follower_target_pos = follower_target_pos
+                .cwiseMax(follower_pos - MAX_TRACKING_ERROR)
+                .cwiseMin(follower_pos + MAX_TRACKING_ERROR);
 
             if (!leader.posVelTorqueKpKd(zero_vec, zero_vec, toStd(leader_torque_cmd),
                                          zero_vec, zero_vec)) {
@@ -611,6 +601,11 @@ int main(int argc, char** argv)
                 (1.0 - phase.sync_activation) * follower_start_gripper
                     + phase.sync_activation * leader_gripper_pos,
                 GRIPPER_POS_LOWER, GRIPPER_POS_UPPER);
+            // 夹爪跟踪误差饱和：主爪拉超从爪机械行程时限制堵转力矩
+            follower_gripper_target = clampScalar(
+                follower_gripper_target,
+                follower_gripper_pos - GRIPPER_MAX_TRACKING_ERROR,
+                follower_gripper_pos + GRIPPER_MAX_TRACKING_ERROR);
 
             // 主臂夹爪: 纯力矩（kp=kd=0），从臂夹爪: 位置跟踪
             if (!leader.gripperControlMIT(leader_gripper_pos, 0.0,
@@ -628,16 +623,18 @@ int main(int argc, char** argv)
             if (now >= next_print) {
                 double actual_rate = report_cycles
                     / std::max(std::chrono::duration<double>(now - report_start).count(), 1e-6);
-                double tracking_error = (leader_pos - follower_pos).cwiseAbs().maxCoeff();
+                int worst_joint = 0;
+                double tracking_error =
+                    (leader_pos - follower_pos).cwiseAbs().maxCoeff(&worst_joint);
                 std::cout << std::fixed << std::setprecision(3)
                           << phase.name << " " << std::setw(3)
                           << (int)(phase.feedback_activation * 100) << "%"
                           << "  频率=" << std::setprecision(1) << actual_rate << "Hz"
-                          << "  误差=" << std::setprecision(3) << tracking_error << "rad"
+                          << "  误差=J" << (worst_joint + 1) << ":"
+                          << std::setprecision(3) << tracking_error << "rad"
                           << "  DOB=" << vecToStr(disturbance)
                           << "  反馈=" << vecToStr(feedback_torque)
                           << "  重置=" << observer_reset_count
-                          << (limited_joint_count > 0 ? "  [限位夹紧]" : "")
                           << "  夹爪主/从=" << std::setprecision(2) << leader_gripper_pos
                           << "/" << follower_gripper_pos
                           << " 测量=" << (follower_gripper_torque - gripper_torque_bias)

@@ -72,9 +72,14 @@ void LiteArm::loadConfig(const std::string& config_path)
         config_ = YAML::LoadFile(config_path);
         std::cout << "配置文件加载成功: " << config_path << std::endl;
 
-        // 读取关节限位
-        if (config_["robot"] && config_["robot"]["joint_limits"]) {
-            auto limits = config_["robot"]["joint_limits"];
+        // 读取关节限位（兼容顶层 joint_limits: 与 robot: 下嵌套两种写法）
+        YAML::Node limits;
+        if (config_["joint_limits"]) {
+            limits = config_["joint_limits"];
+        } else if (config_["robot"] && config_["robot"]["joint_limits"]) {
+            limits = config_["robot"]["joint_limits"];
+        }
+        if (limits) {
             joint_limits_lower_ = limits["lower"].as<std::vector<double>>();
             joint_limits_upper_ = limits["upper"].as<std::vector<double>>();
 
