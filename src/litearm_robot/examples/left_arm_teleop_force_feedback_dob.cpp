@@ -75,10 +75,12 @@ const double FRICTION_SMOOTHING_VELOCITY = 0.05;   // tanh 平滑速度 (rad/s)
 // 力矩安全限幅（与 left_arm_gravity_compensation 一致）
 const Eigen::VectorXd TOTAL_TORQUE_LIMIT = makeVec({15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0});
 // 主臂力反馈限幅 / 斜率限制 (Nm, Nm/s)
-const Eigen::VectorXd FEEDBACK_TORQUE_LIMIT = makeVec({3.0, 5.0, 5.0, 3.0, 1.5, 1.5, 1.0});
-const Eigen::VectorXd FEEDBACK_TORQUE_RATE_LIMIT = makeVec({16.0, 30.0, 30.0, 16.0, 8.0, 8.0, 8.0});
+// 限幅只做异常保护，不应在正常接触中饱和，否则主臂感受到的力比实际偏小
+const Eigen::VectorXd FEEDBACK_TORQUE_LIMIT = makeVec({8.0, 12.0, 12.0, 8.0, 3.0, 3.0, 2.0});
+const Eigen::VectorXd FEEDBACK_TORQUE_RATE_LIMIT = makeVec({80.0, 120.0, 120.0, 80.0, 40.0, 40.0, 30.0});
 // DOB 输出超过该值视为发散，重置观测器
-const Eigen::VectorXd DOB_RESET_LIMIT = makeVec({16.0, 30.0, 30.0, 16.0, 8.0, 8.0, 8.0});
+// 必须大于正常接触可达的力矩，否则用力推从臂会触发重置、力反馈瞬间消失
+const Eigen::VectorXd DOB_RESET_LIMIT = makeVec({30.0, 50.0, 50.0, 30.0, 12.0, 12.0, 8.0});
 // 主臂阻尼，抑制力反馈引起的振荡
 const Eigen::VectorXd MASTER_DAMPING = makeVec({0.12, 0.20, 0.20, 0.08, 0.04, 0.04, 0.03});
 
@@ -109,7 +111,8 @@ const double OBSERVER_WARMUP_TIME = 1.0;            // 观测器预热 (s)
 const double SYNC_TIME = 3.0;                       // 从臂同步到主臂位置 (s)
 const double BIAS_TIME = 1.0;                       // 静态偏置校准 (s)
 const double FEEDBACK_RAMP_TIME = 1.0;              // 力反馈渐入 (s)
-const double DEFAULT_FEEDBACK_GAIN = 0.35;          // 力反馈增益 [0,1]
+const double DEFAULT_FEEDBACK_GAIN = 1.0;           // 力反馈增益，1.0 = 外力矩 1:1 映射到主臂
+                                                    // 自由移动时拖拽感偏重可降低（argv[4]）
 
 // ==================== 工具函数 ====================
 
@@ -326,8 +329,8 @@ int main(int argc, char** argv)
 
         double feedback_gain = DEFAULT_FEEDBACK_GAIN;
         if (argc > 4) feedback_gain = std::stod(argv[4]);
-        if (feedback_gain < 0.0 || feedback_gain > 1.0) {
-            std::cerr << "错误: feedback_gain 必须在 [0, 1] 内" << std::endl;
+        if (feedback_gain < 0.0 || feedback_gain > 1.5) {
+            std::cerr << "错误: feedback_gain 必须在 [0, 1.5] 内" << std::endl;
             return 1;
         }
 
