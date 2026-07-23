@@ -1,0 +1,63 @@
+robot:
+  name: "LiteArm-A10-Arms"
+  max_torque: 15.0
+
+# ── 端口 → 电机 全局ID 映射 ──
+# /dev/ttyACM0 → 全局ID 1-8   (左臂: 7关节 + 夹爪)
+# /dev/ttyACM1 → 全局ID 9-16  (右臂: 7关节 + 夹爪)
+
+groups:
+
+  left:
+    name: "左臂"
+    joint_names:
+      - "l_joint1_joint"
+      - "l_joint2_joint"
+      - "l_joint3_joint"
+      - "l_joint4_joint"
+      - "l_joint5_joint"
+      - "l_joint6_joint"
+      - "l_joint7_joint"
+      - "l_gripper_joint"
+    motor_indices: [1, 2, 3, 4, 5, 6, 7, 8]
+    joint_limits:
+      lower: [-2.4, -0.1, -0.1, -1.6, -1.7, -2.5, -1.0, 0.0]
+      upper: [2.4, 3.2, 4.0, 1.6, 1.7, 2.5, 1.0, 1.8]
+    gripper_index: 7   # index within this group's joint_names that is the gripper
+    end_effector_link: "l_joint7_link"
+
+  right:
+    name: "右臂"
+    joint_names:
+      - "r_joint1_joint"
+      - "r_joint2_joint"
+      - "r_joint3_joint"
+      - "r_joint4_joint"
+      - "r_joint5_joint"
+      - "r_joint6_joint"
+      - "r_joint7_joint"
+      - "r_gripper_joint"
+    motor_indices: [9, 10, 11, 12, 13, 14, 15, 16]
+    joint_limits:
+      lower: [-2.4, -0.1, -0.1, -1.6, -1.7, -2.5, -1.0, 0.0]
+      upper: [2.4, 3.2, 4.0, 1.6, 1.7, 2.5, 1.0, 1.8]
+    gripper_index: 7
+    end_effector_link: "r_joint7_link"
+
+# ── 串口到本地电机ID映射 (传给 MultiMotorManager) ──
+ports:
+  "/dev/ttyACM0": [1, 2, 3, 4, 5, 6, 7, 8]
+  "/dev/ttyACM1": [1, 2, 3, 4, 5, 6, 7, 8]
+
+# ── URDF / FK ──
+urdf:
+  file_path: "../../src/litearm_a10_251125/urdf/LiteArm_A10_251125.urdf"
+  left_arm: "../../src/litearm_robot/urdf/LiteArm_A10_251224_left_arm.urdf"
+  right_arm: "../../src/litearm_robot/urdf/LiteArm_A10_251224_right_arm.urdf"
+
+# ── 控制参数 ──
+control:
+  default_velocity: 0.5
+  loop_hz: 100
+  broadcast_hz: 30
+  home_timeout: 3.0

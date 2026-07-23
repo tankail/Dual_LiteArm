@@ -266,6 +266,18 @@ class MotorDriver:
             payload[i*4+3] = self._i16(kd * 10 * MY_2PI)
         self._send_raw(MODE_POS_VEL_KP_KD, self._pad(MODE_POS_VEL_KP_KD, payload))
 
+    def set_pos_vel_torque_kp_kd(self, local_id_to_pvtkd: dict):
+        """MODE_POS_VEL_TQE_KP_KD_2 (0xB0): 位置+速度+前馈力矩+KP+KD"""
+        payload = [SENTINEL_INT16] * (self.id_max * 5)
+        for lid, (pos, vel, torque, kp, kd) in local_id_to_pvtkd.items():
+            i = lid - 1
+            payload[i*5+0] = self._p2i(pos)
+            payload[i*5+1] = self._v2i(vel)
+            payload[i*5+2] = self._i16(torque / 0.01)  # 力矩, 同 set_pos_vel_max_torque
+            payload[i*5+3] = self._i16(kp * 10 * MY_2PI)
+            payload[i*5+4] = self._i16(kd * 10 * MY_2PI)
+        self._send_raw(MODE_POS_VEL_TQE_KP_KD_2, self._pad(MODE_POS_VEL_TQE_KP_KD_2, payload))
+
     def set_free_mode(self):
         self.set_pos_vel_kp_kd({mid:(0,0,0,0) for mid in self.motor_ids})
 
@@ -438,6 +450,15 @@ class MultiMotorManager:
         by_drv = self._split_by_port(gid_to_pvkd)
         for drv_idx, lid_pvkd in by_drv.items():
             self.drivers[drv_idx].set_pos_vel_kp_kd(lid_pvkd)
+
+    def set_all_pos_vel_torque_kp_kd(self, gid_to_pvtkd: dict):
+        """
+        gid_to_pvtkd: {global_id: (pos, vel, torque, kp, kd)}
+        MODE_POS_VEL_TQE_KP_KD_2 (0xB0) — feed-forward torque control
+        """
+        by_drv = self._split_by_port(gid_to_pvtkd)
+        for drv_idx, lid_pvtkd in by_drv.items():
+            self.drivers[drv_idx].set_pos_vel_torque_kp_kd(lid_pvtkd)
 
     def stop_all(self):
         for d in self.drivers: d.set_stop()
