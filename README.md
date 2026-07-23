@@ -496,3 +496,145 @@ pip install pyserial
 - 录制前电机会进入自由模式（kp=kd=0），手臂会因重力下坠，请用手扶住
 - 使用 `--hold` 参数可启用软保持，利用当前姿态 + 小增益抵消部分重力
 - 端口权限不足时执行：`sudo usermod -a -G dialout $USER`
+
+
+---
+
+## Web 上位机 (Digital Twin Backend)
+
+Flask + SocketIO + Three.js 3D 可视化，仿照 Panthera-HT 架构。不依赖 ROS2，直接通过串口协议控制电机。
+
+### 目录结构
+
+```
+litearm_backend/
+├── backend.sh                # 启动脚本（完整版：4组20电机）
+├── backend_arms.sh           # 启动脚本（双臂版：2组16电机）
+├── app.py                    # Flask+SocketIO 后端（~800行）
+├── robot_param/
+│   ├── litearm_full.yaml     # 完整配置（左臂+右臂+腰部+头部）
+│   └── litearm_arms.yaml     # 双臂配置（左臂+右臂，含夹爪）
+└── frontend/                 # Three.js 前端（Vite 构建）
+    ├── src/
+    │   ├── main.js           # 主入口
+    │   ├── robot/            # RobotConnection 通信层
+    │   ├── ui/               # JointControlsUI, ConnectionUI 等
+    │   └── loaders/          # URDF/STL 加载器
+    └── dist/                 # 构建产物
+```
+
+### 快速启动
+
+```bash
+cd ~/Dual_LiteArm
+
+# Demo 模式（无硬件，正弦波模拟）
+./litearm_backend/backend_arms.sh --demo
+
+# Live 模式（真实硬件）
+./litearm_backend/backend_arms.sh
+
+# 指定端口
+./litearm_backend/backend_arms.sh --port 5002
+```
+
+浏览器打开 **http://localhost:5001**，等待 URDF 模型加载完成即可。
+
+### 硬件配置
+
+| 配置 | 串口 | 电机 | 分组 |
+|------|------|:---:|------|
+| `litearm_arms.yaml` | ACM0 + ACM1 | 16 | 左臂(8) / 右臂(8) |
+| `litearm_full.yaml` | ACM0~3 | 20 | 左臂(8) / 右臂(8) / 腰部(2) / 头部(2) |
+
+每个手臂含 7 个关节 + 1 个夹爪，夹爪统一在所属手臂组内管理。
+
+### 串口名变化
+
+如果 USB 重插后端口名变了（如 ACM0/ACM1 → ACM2/ACM3），修改对应 `litearm_*.yaml` 中的 `ports` 字段：
+
+```yaml
+ports:
+  "/dev/ttyACM2": [1, 2, 3, 4, 5, 6, 7, 8]
+  "/dev/ttyACM3": [1, 2, 3, 4, 5, 6, 7, 8]
+```
+
+### 界面功能
+
+**Robot Connection 面板**：
+| 功能 | 说明 |
+|------|------|
+| URL 输入 | 默认 `http://localhost:5001` |
+| Connect / Disconnect | WebSocket 连接 |
+| **Position** | 位置控制模式（滑块发目标位置） |
+| **Gravity** | 重力补偿模式（Pinocchio RNEA 前馈力矩，kp=kd=0） |
+| **Gra+Fri** | 重力 + 摩擦补偿 |
+| **Impedance** | 阻抗控制 |
+| Waypoints | 保存当前姿态为路径点，可回放轨迹 |
+
+**Joints 面板**：
+| 功能 | 说明 |
+|------|------|
+| Velocity | 滑块 + 数值输入，调节运动速度 |
+| Send Position | 发送当前滑块位置到机器人 |
+| 分组过滤 | 下拉选择：全部 / 🫲左臂 / 🫱右臂 / 🔄腰部 / 👤头部 |
+| 关节滑块 | 每个关节独立滑块，支持拖拽和数值输入 |
+| 限位编辑 | 点击 min/max 值直接修改关节限位 |
+
+**3D 视图**：
+- URDF + STL 模型实时渲染
+- 关节角度实时跟随硬件状态
+- 末端位姿 (FK) 显示
+
+### 控制模式
+
+| 模式 | 后端 mode | 电机命令 |
+|------|-----------|----------|
+| Position | `position` | `MODE_POS_VEL_TQE` (0x90) |
+| Gravity Comp | `gravity_comp` | `MODE_POS_VEL_TQE_KP_KD_2` (0xB0)，pos=vel=kp=kd=0, torque=G(q) |
+| Free | `free` | kp=kd=0（电机掉力，手臂自由） |
+
+### 重力补偿参数
+
+重力补偿使用独立左右臂 URDF（`LiteArm_A10_251224_left_arm.urdf` / `right_arm.urdf`），Pinocchio RNEA 计算 G(q)。
+
+| 参数 | 左臂 | 右臂 |
+|------|------|------|
+| 力矩限幅 (Nm) | [15, 25, 25, 15, 6, 6, 4] | [15, 25, 25, 15, 6, 6, 4] |
+| 重力增益 | [0.85, 1.0, 1.0, 0.8, 1.0, 1.0, 1.0] | [1.0, 1.2, 1.0, 0.8, 1.0, 1.0, 1.0] |
+
+### 架构
+
+```
+                 ┌────────── WebSocket ──────────┐
+  Browser        │  config / robot_state / move_* │   Python Backend
+  ───────        │                                │   ───────────────
+  Three.js  ←── robot_state (30Hz) ──────────── app.py
+  URDF+STL  ──→ move_group / home / stop ────→ MultiMotorManager
+  Joint UI  ──→ set_mode / gravity_comp ────→ motor_driver.py
+                                                    │
+              ┌─────────────────────────────────────┤
+              │  ACM0 (左臂)  │  ACM1 (右臂)         │
+              │  8 motors     │  8 motors            │
+              └─────────────────────────────────────┘
+
+  控制循环: 100Hz  set_all_pos_vel_max_torque / set_all_pos_vel_torque_kp_kd
+  广播循环: 30Hz   request_all_states → WebSocket broadcast
+  FK:      Pinocchio forwardKinematics (左臂末端 = l_joint7_link)
+  重力补偿: Pinocchio RNEA → MODE_POS_VEL_TQE_KP_KD_2 (0xB0)
+```
+
+### 依赖
+
+Conda 环境 `panthera`：
+```bash
+conda activate panthera
+pip install flask flask-socketio flask-cors pyyaml numpy pyserial scipy pinocchio
+```
+
+### 注意事项
+
+- **不能和 ROS2 同时使用** — 后端直接占用串口
+- 重力补偿模式下电机会持续输出力矩，退出前先切回 Position 模式或停止程序
+- 端口权限不足时执行：`sudo usermod -a -G dialout $USER`
+- 前端构建：`cd litearm_backend/frontend && npm run build`

@@ -64,10 +64,10 @@ groups:
 
 # ── 串口到本地电机ID映射 (传给 MultiMotorManager) ──
 ports:
-  "/dev/ttyACM2": [1, 2, 3, 4, 5, 6, 7, 8]
-  "/dev/ttyACM3": [1, 2, 3, 4, 5, 6, 7, 8]
-  "/dev/ttyACM4": [1, 2]
-  "/dev/ttyACM5": [1, 2]
+  "/dev/ttyACM0": [1, 2, 3, 4, 5, 6, 7, 8]
+  "/dev/ttyACM1": [1, 2, 3, 4, 5, 6, 7, 8]
+  "/dev/ttyACM2": [1, 2]
+  "/dev/ttyACM3": [1, 2]
 
 # ── URDF / FK ──
 urdf:
