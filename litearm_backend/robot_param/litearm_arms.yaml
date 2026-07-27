@@ -72,5 +72,14 @@ control:
   default_velocity: 0.5
   loop_hz: 100
   gravity_loop_hz: 200
+  impedance_loop_hz: 200
   broadcast_hz: 30
   home_timeout: 3.0
+
+# 关节空间阻抗控制：
+# tau = G(q) + Kp * (q_target - q) - Kd * dq
+# 下面每组 8 个参数按左/右臂电机的本地顺序复用，最后一个为夹爪。
+impedance:
+  kp: [4.0, 8.0, 8.0, 3.0, 2.0, 1.0, 0.8, 0.0]
+  kd: [0.6, 0.8, 0.8, 0.4, 0.25, 0.15, 0.1, 0.0]
+  torque_limit: [15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0, 2.0]

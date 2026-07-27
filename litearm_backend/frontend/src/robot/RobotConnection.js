@@ -26,7 +26,7 @@ export class RobotConnection {
         this.onError = null            // (error) => void
         this.onModeChanged = null      // (mode) => void
 
-        // Control mode: 'position', 'gravity_comp', 'gravity_friction', 'impedance'
+        // Control mode: 'position', 'gravity_comp', or 'impedance'
         this.controlMode = 'position'
 
         // State cache
@@ -276,12 +276,12 @@ export class RobotConnection {
 
     /**
      * Set control mode
-     * @param {string} mode - 'position', 'gravity_comp', 'gravity_friction', or 'impedance'
+     * @param {string} mode - 'position', 'gravity_comp', or 'impedance'
      */
     setMode(mode) {
         if (!this.connected || !this.socket) return
 
-        if (!['position', 'gravity_comp', 'gravity_friction', 'impedance'].includes(mode)) {
+        if (!['position', 'gravity_comp', 'impedance'].includes(mode)) {
             console.error('[RobotConnection] Invalid mode:', mode)
             return
         }
@@ -296,50 +296,6 @@ export class RobotConnection {
      */
     getMode() {
         return this.controlMode
-    }
-
-    /**
-     * Set impedance target for a single joint
-     * @param {number} jointIndex - Joint index (0-5)
-     * @param {number} position - Target position in radians
-     */
-    setImpedanceTarget(jointIndex, position) {
-        if (!this.connected || !this.socket) return
-
-        // Rate limiting
-        const now = Date.now()
-        if (now - this.lastCommandTime < this.commandInterval) return
-        this.lastCommandTime = now
-
-        this.socket.emit('set_impedance_target', {
-            joint: jointIndex,
-            position: position
-        })
-    }
-
-    /**
-     * Set impedance target for all joints
-     * @param {number[]} positions - Array of 6 joint positions in radians
-     */
-    setImpedanceTargetAll(positions) {
-        if (!this.connected || !this.socket) return
-
-        this.socket.emit('set_impedance_target', { target: positions })
-    }
-
-    /**
-     * Set impedance control parameters
-     * @param {number[]} K - Stiffness array (6 values)
-     * @param {number[]} B - Damping array (6 values)
-     */
-    setImpedanceParams(K, B) {
-        if (!this.connected || !this.socket) return
-
-        const data = {}
-        if (K) data.K = K
-        if (B) data.B = B
-
-        this.socket.emit('set_impedance_params', data)
     }
 
     /**

@@ -141,7 +141,7 @@ export class JointControlsUI {
 
     /**
      * Update current backend control mode.
-     * Joint commands are only allowed in Position mode.
+     * The impedance controller latches the current position on entry.
      */
     setControlMode(mode) {
         this.controlMode = mode || 'position';
