@@ -20,7 +20,10 @@ import yaml
 import threading
 import logging
 import argparse
+import subprocess
+import signal
 import numpy as np
+from serial.tools import list_ports
 
 # ── Path setup: find motor_driver.py ───────────────────────────
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -78,6 +81,10 @@ velocities = np.array([], dtype=np.float64)
 torques = np.array([], dtype=np.float64)
 connected = False
 grav_engine = None  # GravityCompensationEngine, initialized after config loaded
+gravity_process = None  # External C++ gravity runner process
+gravity_serial_released = False
+gravity_transitioning = False
+active_config_path = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -90,10 +97,11 @@ def load_config(path):
         cfg = yaml.safe_load(f)
     # Resolve relative paths
     cfg['_config_dir'] = os.path.dirname(os.path.abspath(path))
-    urdf_rel = cfg.get('urdf', {}).get('file_path', '')
-    if urdf_rel and not os.path.isabs(urdf_rel):
-        cfg['urdf']['file_path'] = os.path.normpath(
-            os.path.join(cfg['_config_dir'], urdf_rel))
+    for key in ('file_path', 'left_arm', 'right_arm'):
+        urdf_rel = cfg.get('urdf', {}).get(key, '')
+        if urdf_rel and not os.path.isabs(urdf_rel):
+            cfg['urdf'][key] = os.path.normpath(
+                os.path.join(cfg['_config_dir'], urdf_rel))
     return cfg
 
 
@@ -120,6 +128,123 @@ def build_joint_list(cfg):
             })
     joints.sort(key=lambda j: j['global_id'])
     return joints
+
+
+def build_port_motor_types(cfg):
+    """Normalize YAML motor type lists to {port: {local_id: type}}."""
+    result = {}
+    for port, values in cfg.get('motor_types', {}).items():
+        if isinstance(values, list):
+            result[port] = {i + 1: str(value) for i, value in enumerate(values)}
+        elif isinstance(values, dict):
+            result[port] = {int(k): str(v) for k, v in values.items()}
+    return result
+
+
+def _split_numeric_port(path):
+    """Return (/dev/ttyACM, 0) for /dev/ttyACM0; otherwise (path, None)."""
+    i = len(path)
+    while i > 0 and path[i - 1].isdigit():
+        i -= 1
+    if i == len(path):
+        return path, None
+    return path[:i], int(path[i:])
+
+
+def _serial_sort_key(path):
+    prefix, num = _split_numeric_port(path)
+    return (prefix, num if num is not None else 10**9, path)
+
+
+def _candidate_serial_ports(prefix):
+    """Match the C++ driver behavior: scan /dev/ttyACM* and sort numerically."""
+    ports = []
+    for info in list_ports.comports():
+        device = getattr(info, 'device', '')
+        if not device.startswith(prefix):
+            continue
+        vid = getattr(info, 'vid', None)
+        pid = getattr(info, 'pid', None)
+        # The C++ driver accepts LivelyBot USB boards with PID 0xffff
+        # and VID 0xcaf1/0xcae1. If VID/PID is unavailable, keep the
+        # device as a fallback because some kernels do not expose it here.
+        if pid is None or vid is None or (pid == 0xffff and vid in (0xcaf1, 0xcae1)):
+            ports.append(device)
+    return sorted(set(ports), key=_serial_sort_key)
+
+
+def resolve_serial_ports(cfg):
+    """
+    Keep YAML port order, but resolve missing /dev/ttyACM0 style names by
+    scanning existing numbered ttyACM devices. This mirrors the C++ LiteArm
+    code where serial_id=1 means the first detected matching ttyACM device.
+    """
+    serial_cfg = cfg.get('serial', {})
+    auto_resolve = serial_cfg.get('auto_resolve', True)
+    wait_timeout = float(serial_cfg.get('wait_timeout', 5.0))
+    wait_interval = float(serial_cfg.get('wait_interval', 0.2))
+    configured = list(cfg.get('ports', {}).items())
+    if not configured:
+        return cfg
+
+    deadline = time.time() + wait_timeout
+    last_detected = {}
+    resolved = None
+
+    while True:
+        attempted = {}
+        ok = True
+
+        grouped = {}
+        for port, _ids in configured:
+            prefix, _num = _split_numeric_port(port)
+            grouped.setdefault(prefix, []).append(port)
+
+        for prefix, requested_ports in grouped.items():
+            detected = _candidate_serial_ports(prefix)
+            last_detected[prefix] = detected
+
+            exact_available = all(os.path.exists(p) for p in requested_ports)
+            if exact_available:
+                for p in requested_ports:
+                    attempted[p] = p
+                continue
+
+            if auto_resolve and len(detected) >= len(requested_ports):
+                for old, new in zip(requested_ports, detected):
+                    attempted[old] = new
+                continue
+
+            ok = False
+
+        if ok:
+            resolved = attempted
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(wait_interval)
+
+    if resolved is None:
+        details = ', '.join(
+            f"{prefix}: {ports or 'none'}" for prefix, ports in last_detected.items())
+        raise FileNotFoundError(
+            "No usable LiteArm serial ports. "
+            f"configured={list(cfg.get('ports', {}).keys())}; detected={details}")
+
+    remapped = [(old, new) for old, new in resolved.items() if old != new]
+    if remapped:
+        print("   Serial ports remapped after scan:")
+        for old, new in remapped:
+            print(f"     {old} -> {new}")
+
+    old_ports = cfg.get('ports', {})
+    old_types = cfg.get('motor_types', {})
+    cfg['ports'] = {resolved[old]: ids for old, ids in configured}
+    cfg['motor_types'] = {
+        resolved.get(old, old): types for old, types in old_types.items()
+        if old in resolved
+    }
+    return cfg
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -288,8 +413,10 @@ class GravityCompensationEngine:
             except Exception as e:
                 print(f"[Gravity] {side} arm init failed: {e}")
 
-        if len(self.models) > 0:
+        if set(self.models) == set(configs):
             self.ready = True
+        else:
+            print("[Gravity] disabled: both left and right arm models are required")
 
     def compute(self, joint_positions, side='left'):
         """Compute gravity torque for one arm via RNEA with v=0, a=0."""
@@ -338,18 +465,152 @@ def _get_gravity_engine():
         left_urdf = config.get('urdf', {}).get('left_arm', '')
         right_urdf = config.get('urdf', {}).get('right_arm', '')
         if left_urdf and right_urdf:
-            left_path = os.path.join(BACKEND_DIR, left_urdf) if not os.path.isabs(left_urdf) else left_urdf
-            right_path = os.path.join(BACKEND_DIR, right_urdf) if not os.path.isabs(right_urdf) else right_urdf
-            grav_engine = GravityCompensationEngine(left_path, right_path)
+            grav_engine = GravityCompensationEngine(left_urdf, right_urdf)
     return grav_engine
+
+
+def _read_states():
+    """Request and copy the latest motor states into the shared arrays."""
+    global positions, velocities, torques
+    if robot is None:
+        return
+    robot.request_all_states()
+    states = robot.get_all_states()
+    with state_lock:
+        for gid in range(1, MOTOR_COUNT + 1):
+            st = states.get(gid)
+            idx = gid - 1
+            if st and abs(st.pos) < 100:
+                positions[idx] = st.pos
+                velocities[idx] = st.vel
+                torques[idx] = st.torque
+
+
+def _hold_current_positions():
+    """Prevent a mode change from sending stale position targets."""
+    with state_lock:
+        current = positions.copy()
+    with target_lock:
+        for i, value in enumerate(current, start=1):
+            targets[i] = float(value)
+
+
+def _gravity_runner_path():
+    return os.path.join(BACKEND_DIR, 'gravity_compensation_runner.py')
+
+
+def _is_gravity_runner_alive():
+    return gravity_process is not None and gravity_process.poll() is None
+
+
+def _release_robot_for_external_gravity():
+    global robot, gravity_serial_released
+    if robot is None or demo_mode:
+        return
+    try:
+        robot.stop_all()
+    except Exception:
+        pass
+    try:
+        robot.close_all()
+    except Exception:
+        pass
+    gravity_serial_released = True
+
+
+def _restore_robot_after_external_gravity():
+    global robot, gravity_serial_released
+    if demo_mode or not gravity_serial_released:
+        return
+    if not active_config_path:
+        gravity_serial_released = False
+        return
+    try:
+        print("[Gravity] Re-opening backend serial connection")
+        robot = init_robot(active_config_path)
+        gravity_serial_released = False
+        _read_states()
+        _hold_current_positions()
+    except Exception as exc:
+        gravity_serial_released = False
+        print(f"[Gravity] Failed to re-open backend serial connection: {exc}")
+
+
+def _start_external_gravity():
+    global gravity_process, control_mode, gravity_transitioning
+    if demo_mode:
+        return False, "demo mode does not use external gravity compensation"
+    if _is_gravity_runner_alive():
+        return True, None
+
+    runner = _gravity_runner_path()
+    if not os.path.exists(runner):
+        return False, f"gravity runner not found: {runner}"
+
+    gravity_transitioning = True
+
+    try:
+        _hold_current_positions()
+        control_mode = 'gravity_comp'
+        _release_robot_for_external_gravity()
+        gravity_process = subprocess.Popen(
+            [sys.executable, runner, '--side', 'both'],
+            cwd=BACKEND_DIR,
+            stdout=None,
+            stderr=None,
+            start_new_session=True,
+        )
+        time.sleep(0.3)
+        if gravity_process.poll() is not None:
+            code = gravity_process.returncode
+            gravity_process = None
+            _restore_robot_after_external_gravity()
+            control_mode = 'position'
+            return False, f"gravity runner exited immediately with code {code}"
+        print(f"[Gravity] External C++ runner started, pid={gravity_process.pid}")
+        return True, None
+    except Exception as exc:
+        gravity_process = None
+        _restore_robot_after_external_gravity()
+        control_mode = 'position'
+        return False, str(exc)
+    finally:
+        gravity_transitioning = False
+
+
+def _stop_external_gravity(restore_robot=True):
+    global gravity_process
+    proc = gravity_process
+    gravity_process = None
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=4.0)
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    if restore_robot:
+        _restore_robot_after_external_gravity()
 
 
 def control_loop():
     """Send position commands to motors at control rate."""
     global running, targets, control_mode
     loop_hz = config.get('control', {}).get('loop_hz', 100)
-    interval = 1.0 / loop_hz
-    print(f"[Control] Starting at {loop_hz} Hz")
+    gravity_loop_hz = config.get('control', {}).get('gravity_loop_hz', 200)
+    print(f"[Control] Starting at {loop_hz} Hz "
+          f"(gravity compensation: {gravity_loop_hz} Hz)")
 
     while running:
         t0 = time.time()
@@ -358,26 +619,13 @@ def control_loop():
                 pass
 
             elif control_mode == 'gravity_comp':
-                # Gravity compensation: RNEA torque → MODE_POS_VEL_TQE_KP_KD_2
-                grav = _get_gravity_engine()
-                if grav and grav.ready and robot is not None:
-                    with state_lock:
-                        l_pos = positions[0:7].copy()
-                        r_pos = positions[8:15].copy()
-                    for side, pos in [('left', l_pos), ('right', r_pos)]:
-                        G = grav.compute(pos.tolist(), side)
-                        if G is None:
-                            continue
-                        start_gid = 1 if side == 'left' else 9
-                        cmd = {}
-                        for i, g in enumerate(G):
-                            gid = start_gid + i
-                            # pos=0, vel=0, torque=g, kp=0, kd=0 → pure feed-forward
-                            cmd[gid] = (0.0, 0.0, float(g), 0.0, 0.0)
-                        try:
-                            robot.set_all_pos_vel_torque_kp_kd(cmd)
-                        except Exception:
-                            pass
+                # External C++ examples own the serial ports in this mode.
+                if (gravity_serial_released and not gravity_transitioning
+                        and not _is_gravity_runner_alive()):
+                    print("[Gravity] External runner stopped unexpectedly; returning to position mode")
+                    _stop_external_gravity(restore_robot=True)
+                    control_mode = 'position'
+                pass
 
             elif control_mode == 'position' and targets:
                 cmd = {}
@@ -394,6 +642,8 @@ def control_loop():
         except Exception as e:
             print(f"[Control] Error: {e}")
 
+        active_hz = gravity_loop_hz if control_mode == 'gravity_comp' else loop_hz
+        interval = 1.0 / max(float(active_hz), 1.0)
         elapsed = time.time() - t0
         if elapsed < interval:
             time.sleep(interval - elapsed)
@@ -430,18 +680,8 @@ def state_broadcast_loop():
         t0 = time.time()
         try:
             if robot is not None:
-                robot.request_all_states()
-                states = robot.get_all_states()
-
-                with state_lock:
-                    for gid in range(1, MOTOR_COUNT + 1):
-                        st = states.get(gid)
-                        idx = gid - 1
-                        if st and abs(st.pos) < 100:
-                            positions[idx] = st.pos
-                            velocities[idx] = st.vel
-                            torques[idx] = st.torque
-                        # else keep previous value
+                if control_mode != 'gravity_comp':
+                    _read_states()
 
                 # Build state dict — per-group slices from config
                 state = {
@@ -639,8 +879,15 @@ def api_set_mode():
     global control_mode
     data = flask_request.get_json()
     mode = data.get('mode', 'position')
-    if mode not in ('position', 'free'):
+    if mode not in ('position', 'free', 'gravity_comp'):
         return jsonify({'error': f'Unknown mode: {mode}'}), 400
+    if mode == 'gravity_comp':
+        ok, error = _start_external_gravity()
+        if not ok:
+            return jsonify({'error': error}), 503
+    if control_mode == 'gravity_comp' and mode != 'gravity_comp':
+        _stop_external_gravity(restore_robot=True)
+        _hold_current_positions()
     control_mode = mode
     if mode == 'free' and robot is not None:
         try:
@@ -780,10 +1027,19 @@ def ws_gravity_comp(data=None):
     global control_mode
     enable = data.get('enable', True) if isinstance(data, dict) else True
     if enable:
+        ok, error = _start_external_gravity()
+        if not ok:
+            print(f"[Gravity] Compensation rejected: {error}")
+            socketio.emit('backend_error', {
+                'message': f'重力补偿启动失败: {error}'
+            })
+            return
         control_mode = 'gravity_comp'
-        _get_gravity_engine()  # ensure engine is initialized
-        print("[Gravity] Compensation ENABLED")
+        print("[Gravity] Compensation ENABLED via C++ runner")
     else:
+        if control_mode == 'gravity_comp':
+            _stop_external_gravity(restore_robot=True)
+            _hold_current_positions()
         control_mode = 'position'
         print("[Gravity] Compensation DISABLED → position mode")
     socketio.emit('mode_changed', {'mode': control_mode})
@@ -794,9 +1050,20 @@ def ws_set_mode(data):
     global control_mode
     mode = data.get('mode', 'position')
     if mode in ('position', 'free', 'gravity_comp'):
+        if mode == 'gravity_comp':
+            ok, error = _start_external_gravity()
+            if not ok:
+                print(f"[Gravity] Mode change rejected: {error}")
+                socketio.emit('backend_error', {
+                    'message': f'重力补偿启动失败: {error}'
+                })
+                return
+        if control_mode == 'gravity_comp' and mode != 'gravity_comp':
+            _stop_external_gravity(restore_robot=True)
+            _hold_current_positions()
         control_mode = mode
         if mode == 'gravity_comp':
-            _get_gravity_engine()
+            print("[Gravity] Compensation ENABLED via C++ runner")
         elif mode == 'free' and robot is not None:
             try:
                 robot.set_all_free_mode()
@@ -820,20 +1087,23 @@ def init_robot(cfg_path):
     # Load config
     print(f"1. Loading config: {cfg_path}")
     cfg = load_config(cfg_path)
+    cfg = resolve_serial_ports(cfg)
     config.update(cfg)
     print(f"   Robot: {cfg['robot']['name']}")
     print(f"   Groups: {list(cfg['groups'].keys())}")
 
     # Build port → motor map
     port_map = {}
+    port_motor_types = build_port_motor_types(cfg)
     for port, local_ids in cfg['ports'].items():
         port_map[port] = local_ids
-        print(f"   {port} → {len(local_ids)} motors")
+        print(f"   {port} → {len(local_ids)} motors, types="
+              f"{[port_motor_types.get(port, {}).get(i, 'NONE') for i in local_ids]}")
 
     total_motors = sum(len(v) for v in port_map.values())
     print(f"\n2. Initializing {total_motors} motors on {len(port_map)} ports...")
 
-    mgr = MultiMotorManager(port_map)
+    mgr = MultiMotorManager(port_map, port_motor_types)
     mgr.open_all()
     mgr.init_all()
     print(f"   Connected! Global IDs: {mgr.global_ids}")
@@ -882,7 +1152,7 @@ def init_demo():
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    global robot, config, demo_mode, running
+    global robot, config, demo_mode, running, active_config_path
     p = argparse.ArgumentParser(description='LiteArm A10 Backend')
     p.add_argument('--config', type=str,
                    default='robot_param/litearm_full.yaml',
@@ -897,6 +1167,7 @@ def main():
     cfg_path = os.path.join(BACKEND_DIR, args.config)
     if os.path.exists(cfg_path):
         config.update(load_config(cfg_path))
+        active_config_path = cfg_path
     else:
         # Minimal fallback config
         config.update({
@@ -949,6 +1220,7 @@ def main():
         running = False
         if robot is not None and not demo_mode:
             try:
+                _stop_external_gravity(restore_robot=False)
                 robot.stop_all()
                 robot.close_all()
             except Exception:

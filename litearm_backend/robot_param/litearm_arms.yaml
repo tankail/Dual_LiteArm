@@ -49,6 +49,18 @@ ports:
   "/dev/ttyACM0": [1, 2, 3, 4, 5, 6, 7, 8]
   "/dev/ttyACM1": [1, 2, 3, 4, 5, 6, 7, 8]
 
+# Python 上位机打开串口前会像 C++ 驱动一样扫描 /dev/ttyACM*。
+# 如果 ACM0/ACM1 被系统枚举成 ACM2/ACM3，会按数字顺序自动映射。
+serial:
+  auto_resolve: true
+  wait_timeout: 5.0
+  wait_interval: 0.2
+
+# 与 litearm_left/right_arm_motors.yaml 中的 C++ 电机类型保持一致。
+motor_types:
+  "/dev/ttyACM0": ["7256_35", "7256_35", "6056_36", "6056_36", "4438_30", "5047_36", "4438_30", "4438_30"]
+  "/dev/ttyACM1": ["7256_35", "7256_35", "6056_36", "6056_36", "4438_30", "5047_36", "4438_30", "4438_30"]
+
 # ── URDF / FK ──
 urdf:
   file_path: "../../src/litearm_a10_251125/urdf/LiteArm_A10_251125.urdf"
@@ -59,5 +71,6 @@ urdf:
 control:
   default_velocity: 0.5
   loop_hz: 100
+  gravity_loop_hz: 200
   broadcast_hz: 30
   home_timeout: 3.0
