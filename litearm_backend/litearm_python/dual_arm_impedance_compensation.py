@@ -16,7 +16,12 @@ import time
 
 import numpy as np
 
-from litearm_control import DEFAULT_CONFIG, DualLiteArmPython, format_vector, valid_vector
+from litearm_control import (
+    DEFAULT_CONFIG,
+    DualLiteArmPython,
+    format_vector,
+    valid_vector,
+)
 
 
 keep_running = True
@@ -37,11 +42,51 @@ def _target_argument(values, name):
     return target[:7].copy()
 
 
+def _print_table(side, q, dq, target, terms):
+    print(f"\n[{side}] tau = G(q) + Kp(q_target - q) - Kd*dq")
+    print("+------+----------+----------+----------+----------+----------+----------+----------+")
+    print("| joint| q(deg)   | target   | error    | dq       | G(Nm)    | PD(Nm)   | tau(Nm)  |")
+    print("+------+----------+----------+----------+----------+----------+----------+----------+")
+    for i in range(7):
+        error = target[i] - q[i]
+        print(
+            f"| j{i + 1:<4}"
+            f"| {q[i] * 180.0 / np.pi:8.2f} "
+            f"| {target[i]:8.4f} "
+            f"| {error:8.4f} "
+            f"| {dq[i]:8.4f} "
+            f"| {terms.gravity[i]:8.4f} "
+            f"| {terms.pd[i]:8.4f} "
+            f"| {terms.clipped[i]:8.4f} |"
+        )
+    print("+------+----------+----------+----------+----------+----------+----------+----------+")
+    print(
+        f"| |tau raw| sum = {abs(terms.total).sum():.4f} Nm, "
+        f"|tau clipped| sum = {abs(terms.clipped).sum():.4f} Nm |"
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="LiteArm dual-arm impedance control")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="dual-arm backend YAML")
-    parser.add_argument("--rate", type=float, default=200.0, help="control rate in Hz")
-    parser.add_argument("--print-interval", type=float, default=0.5, help="print interval")
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=1.0,
+        help="terminal sample/print rate in Hz (default: 1)",
+    )
+    parser.add_argument(
+        "--print-interval",
+        type=float,
+        default=None,
+        help="legacy print interval in seconds; overrides --rate",
+    )
+    parser.add_argument(
+        "--control-rate",
+        type=float,
+        default=200.0,
+        help="MIT torque control rate in Hz (default: 200)",
+    )
     parser.add_argument("--left-target", nargs=7, type=float, default=None)
     parser.add_argument("--right-target", nargs=7, type=float, default=None)
     parser.add_argument("--dry-run", action="store_true", help="print torques only")
@@ -87,18 +132,27 @@ def main():
             "torque limit: "
             f"{format_vector(robot.dynamics['left'].torque_limit)}"
         )
-        print("feedback: direct q/dq, no jump filtering or hold-last-sample")
+        print("feedback: direct q/dq with joint-limit and jump fault protection")
         print(f"mode: {'DRY-RUN' if args.dry_run else 'MIT torque output'}")
+        if args.print_interval is not None:
+            print_period = max(float(args.print_interval), 0.001)
+            output_rate = 1.0 / print_period
+        else:
+            output_rate = max(float(args.rate), 0.1)
+            print_period = 1.0 / output_rate
+        control_rate = max(float(args.control_rate), 1.0)
+        print(f"control rate: {control_rate:.2f} Hz")
+        print(f"terminal sample/print rate: {output_rate:.2f} Hz")
         print(f"[left] q_target(rad):  {format_vector(targets['left'])}")
         print(f"[right] q_target(rad): {format_vector(targets['right'])}")
 
-        next_tick = time.monotonic()
-        period = 1.0 / max(args.rate, 1.0)
-        last_print = 0.0
-        loop_count = 0
+        control_period = 1.0 / control_rate
+        next_control_tick = time.monotonic()
+        next_print_tick = next_control_tick
+        sample = 0
 
         while keep_running:
-            next_tick += period
+            next_control_tick += control_period
             robot.read_state()
             robot.validate_arms()
             left_q = robot.arm_q("left")
@@ -119,20 +173,32 @@ def main():
                 robot.send_mit_torque(left_torque, right_torque)
 
             now = time.monotonic()
-            if now - last_print >= args.print_interval:
-                print(f"\n--- impedance loop #{loop_count} ---")
-                print(f"[left] q(rad):  {format_vector(left_q)}")
-                print(f"[left] tau(Nm): {format_vector(left_torque)}")
-                print(f"[right] q(rad): {format_vector(right_q)}")
-                print(f"[right] tau(Nm): {format_vector(right_torque)}")
-                last_print = now
+            if now >= next_print_tick:
+                sample += 1
+                print(f"\n========== sample #{sample} ==========")
+                _print_table(
+                    "left",
+                    left_q,
+                    left_dq,
+                    targets["left"],
+                    left_terms,
+                )
+                _print_table(
+                    "right",
+                    right_q,
+                    right_dq,
+                    targets["right"],
+                    right_terms,
+                )
+                next_print_tick += print_period
+                if time.monotonic() > next_print_tick + print_period:
+                    next_print_tick = time.monotonic() + print_period
 
-            sleep_time = next_tick - time.monotonic()
+            sleep_time = next_control_tick - time.monotonic()
             if sleep_time > 0.0:
                 time.sleep(sleep_time)
-            elif time.monotonic() > next_tick + period:
-                next_tick = time.monotonic()
-            loop_count += 1
+            elif time.monotonic() > next_control_tick + control_period:
+                next_control_tick = time.monotonic()
     except Exception as exc:
         print(f"\n[Error] impedance control stopped: {exc}", file=sys.stderr)
         return 1

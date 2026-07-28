@@ -20,7 +20,18 @@ def _signal_handler(_signum, _frame):
 def parse_args():
     parser = argparse.ArgumentParser(description="LiteArm dual-arm impedance torque calculator")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="dual-arm backend YAML")
-    parser.add_argument("--print-interval", type=float, default=1.0, help="print interval")
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=1.0,
+        help="terminal sample/print rate in Hz (default: 1)",
+    )
+    parser.add_argument(
+        "--print-interval",
+        type=float,
+        default=None,
+        help="legacy print interval in seconds; overrides --rate",
+    )
     parser.add_argument("--samples", type=int, default=0, help="0 means run until Ctrl+C")
     return parser.parse_args()
 
@@ -64,12 +75,21 @@ def main():
     robot.print_summary()
     print("\nDual-arm impedance torque calculator")
     print("No MIT torque output is sent.")
+    if args.print_interval is not None:
+        period = max(float(args.print_interval), 0.001)
+        output_rate = 1.0 / period
+    else:
+        output_rate = max(float(args.rate), 0.1)
+        period = 1.0 / output_rate
+    print(f"terminal sample/print rate: {output_rate:.2f} Hz")
     print(f"[left] q_target(rad):  {format_vector(targets['left'], 4)}")
     print(f"[right] q_target(rad): {format_vector(targets['right'], 4)}")
 
     sample = 0
+    next_tick = time.monotonic()
     try:
         while keep_running:
+            next_tick += period
             sample += 1
             robot.read_state()
             robot.validate_arms()
@@ -86,7 +106,14 @@ def main():
 
             if args.samples > 0 and sample >= args.samples:
                 break
-            time.sleep(max(args.print_interval, 0.01))
+
+            sleep_time = next_tick - time.monotonic()
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+            elif time.monotonic() > next_tick + period:
+                # Do not accumulate delay when terminal output or serial
+                # communication takes longer than the requested period.
+                next_tick = time.monotonic()
     finally:
         robot.close(stop=False)
         print("Impedance calculator stopped.")

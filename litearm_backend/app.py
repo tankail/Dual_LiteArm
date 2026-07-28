@@ -452,6 +452,25 @@ def _hold_current_positions(current=None):
             targets[i] = float(value)
 
 
+def _backend_position_commands_allowed():
+    """Return whether the backend is the current position-mode owner."""
+    return (
+        control_mode == 'position'
+        and robot is not None
+        and not gravity_serial_released
+        and not impedance_serial_released
+        and not gravity_transitioning
+        and not impedance_transitioning
+    )
+
+
+def _position_target_updates_allowed():
+    """Only accept position targets when the backend owns position control."""
+    if demo_mode:
+        return control_mode == 'position'
+    return _backend_position_commands_allowed()
+
+
 def _snapshot_live_positions():
     """
     Capture a verified, fresh position snapshot before a controller handoff.
@@ -582,6 +601,66 @@ def _is_gravity_runner_alive():
     return gravity_process is not None and gravity_process.poll() is None
 
 
+def _wait_process_exit(proc, timeout=4.0):
+    """Wait for a child process without sending another control signal."""
+    if proc is None:
+        return True
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return proc.poll() is not None
+
+
+def _terminate_process_group(proc, timeout=4.0):
+    """Gracefully stop a mode process, escalating only if it is stuck."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    if _wait_process_exit(proc, timeout):
+        return
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    _wait_process_exit(proc, timeout=0.5)
+
+
+def _request_gravity_handoff(proc):
+    """Ask Gravity to exit without STOP, then wait before port transfer."""
+    if proc is None or proc.poll() is not None:
+        return True
+    try:
+        os.killpg(proc.pid, signal.SIGUSR1)
+    except Exception as exc:
+        print(f"[Impedance] Gravity handoff signal failed: {exc}")
+        return False
+
+    # The old code waited 50 ms and then sent SIGINT through
+    # _stop_external_gravity(). That could race the SIGUSR1 handler and make
+    # Gravity execute robot.close(stop=True) during the handoff.
+    if _wait_process_exit(proc, timeout=4.0):
+        return True
+
+    print("[Impedance] Gravity did not exit after handoff request; stopping it")
+    _terminate_process_group(proc)
+    return False
+
+
 def _release_robot_for_external_gravity():
     global robot, gravity_serial_released
     global backend_serial_fault, backend_serial_fault_message
@@ -623,7 +702,6 @@ def _restore_robot_after_external_gravity():
             robot = init_robot(active_config_path)
             gravity_serial_released = False
             _read_states()
-            _hold_current_positions()
             backend_serial_fault = False
             backend_serial_fault_message = ""
             return True
@@ -696,32 +774,27 @@ def _start_external_gravity():
 
 
 def _stop_external_gravity(restore_robot=True):
-    global gravity_process
+    global gravity_process, gravity_transitioning, control_mode
     with mode_transition_lock:
+        owns_transition = not gravity_transitioning
+        if owns_transition:
+            gravity_transitioning = True
         restored = True
-        proc = gravity_process
-        gravity_process = None
-        if proc is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGINT)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            try:
-                proc.wait(timeout=4.0)
-            except Exception:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        if restore_robot:
-            restored = _restore_robot_after_external_gravity()
-        return restored
+        try:
+            proc = gravity_process
+            gravity_process = None
+            _terminate_process_group(proc)
+            if restore_robot:
+                restored = _restore_robot_after_external_gravity()
+            # Keep the controller in a neutral state until the caller has
+            # explicitly selected the next mode. This prevents the control
+            # loop from treating the stopping process as an unexpected exit.
+            if restore_robot:
+                control_mode = 'free'
+            return restored
+        finally:
+            if owns_transition:
+                gravity_transitioning = False
 
 
 def _impedance_runner_path():
@@ -772,7 +845,6 @@ def _restore_robot_after_external_impedance():
             robot = init_robot(active_config_path)
             impedance_serial_released = False
             _read_states()
-            _hold_current_positions()
             backend_serial_fault = False
             backend_serial_fault_message = ""
             return True
@@ -882,56 +954,51 @@ def _start_external_impedance(skip_backend_handoff=False):
 
 def _switch_gravity_to_impedance():
     """Hand serial ownership directly from Gravity Python to Impedance Python."""
-    global impedance_transitioning
+    global control_mode, impedance_transitioning, gravity_transitioning
+    global gravity_process
     with mode_transition_lock:
         if not gravity_serial_released:
             return _start_external_impedance()
 
         impedance_transitioning = True
+        gravity_transitioning = True
         try:
             print("[Impedance] Direct Gravity -> Impedance handoff")
             # Tell the Gravity script not to send STOP in its finally block.
             # The last gravity MIT command stays active until the Impedance
             # script opens the ports and sends its first torque command.
-            if gravity_process is not None and gravity_process.poll() is None:
-                try:
-                    os.killpg(gravity_process.pid, signal.SIGUSR1)
-                    time.sleep(0.05)
-                except Exception as exc:
-                    print(f"[Impedance] Gravity handoff signal failed: {exc}")
-            _stop_external_gravity(restore_robot=False)
+            proc = gravity_process
+            handoff_ok = _request_gravity_handoff(proc)
+            gravity_process = None
+            if not handoff_ok:
+                _restore_robot_after_external_gravity()
+                control_mode = 'free'
+                return False, "gravity handoff failed before impedance start"
             return _start_external_impedance(skip_backend_handoff=True)
         finally:
+            gravity_transitioning = False
             impedance_transitioning = False
 
 
 def _stop_external_impedance(restore_robot=True):
-    global impedance_process
+    global impedance_process, impedance_transitioning, control_mode
     with mode_transition_lock:
+        owns_transition = not impedance_transitioning
+        if owns_transition:
+            impedance_transitioning = True
         restored = True
-        proc = impedance_process
-        impedance_process = None
-        if proc is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGINT)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            try:
-                proc.wait(timeout=4.0)
-            except Exception:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        if restore_robot:
-            restored = _restore_robot_after_external_impedance()
-        return restored
+        try:
+            proc = impedance_process
+            impedance_process = None
+            _terminate_process_group(proc)
+            if restore_robot:
+                restored = _restore_robot_after_external_impedance()
+            if restore_robot:
+                control_mode = 'free'
+            return restored
+        finally:
+            if owns_transition:
+                impedance_transitioning = False
 
 
 def _script_is_alive():
@@ -1137,7 +1204,7 @@ def control_loop():
                         and not _script_is_alive()):
                     print("[Gravity] External script stopped unexpectedly; restoring backend serial")
                     restored = _stop_external_gravity(restore_robot=True)
-                    control_mode = 'position' if restored else 'free'
+                    control_mode = 'free'
                 pass
 
             elif control_mode == 'script':
@@ -1150,27 +1217,36 @@ def control_loop():
                         and not _is_impedance_runner_alive()):
                     print("[Impedance] External script stopped unexpectedly; restoring backend serial")
                     restored = _stop_external_impedance(restore_robot=True)
-                    control_mode = 'position' if restored else 'free'
+                    control_mode = 'free'
 
-            elif (control_mode == 'position' and targets
-                  and not gravity_transitioning
-                  and not impedance_transitioning):
-                cmd = {}
-                default_vel = float(config.get('control', {}).get('default_velocity', 0.5))
-                max_torque = float(config.get('robot', {}).get('max_torque', 15.0))
-                with target_lock:
-                    for gid, tgt in targets.items():
-                        cmd[gid] = (float(tgt), default_vel, max_torque)
-                if cmd:
-                    with serial_io_lock:
-                        current_robot = robot
-                        if current_robot is not None:
-                            try:
-                                current_robot.set_all_pos_vel_max_torque(cmd)
-                            except Exception as exc:
-                                _drop_backend_robot(
-                                    f"position command failed: {exc}",
-                                    current_robot)
+            elif control_mode == 'position':
+                # Check the mode and send under the same transition lock.
+                # Otherwise a stale position command can race a mode handoff
+                # between the condition check and the serial write.
+                with mode_transition_lock:
+                    if _backend_position_commands_allowed():
+                        cmd = {}
+                        default_vel = float(
+                            config.get('control', {}).get(
+                                'default_velocity', 0.5))
+                        max_torque = float(
+                            config.get('robot', {}).get(
+                                'max_torque', 15.0))
+                        with target_lock:
+                            for gid, tgt in targets.items():
+                                cmd[gid] = (
+                                    float(tgt), default_vel, max_torque)
+                        if cmd:
+                            with serial_io_lock:
+                                current_robot = robot
+                                if current_robot is not None:
+                                    try:
+                                        current_robot.set_all_pos_vel_max_torque(
+                                            cmd)
+                                    except Exception as exc:
+                                        _drop_backend_robot(
+                                            f"position command failed: {exc}",
+                                            current_robot)
         except Exception as e:
             print(f"[Control] Error: {e}")
 
@@ -1360,6 +1436,10 @@ def api_move():
     data = flask_request.get_json()
     if not data:
         return jsonify({'error': 'No JSON body'}), 400
+    if not _position_target_updates_allowed():
+        return jsonify({
+            'error': f'position target update rejected in {control_mode} mode'
+        }), 409
 
     velocity = float(data.get('velocity', config.get('control', {}).get('default_velocity', 0.5)))
     max_torque = float(data.get('max_torque', config.get('robot', {}).get('max_torque', 15.0)))
@@ -1403,6 +1483,10 @@ def api_move():
 @app.route('/api/home', methods=['POST'])
 def api_home():
     """Home all joints to zero (smooth)."""
+    if not _position_target_updates_allowed():
+        return jsonify({
+            'error': f'home rejected in {control_mode} mode'
+        }), 409
     group = flask_request.get_json().get('group', None) if flask_request.is_json else None
     velocity = 0.3
 
@@ -1630,6 +1714,12 @@ def on_disconnect():
 
 @socketio.on('move_all')
 def ws_move_all(data):
+    if not _position_target_updates_allowed():
+        print(f"[Move] ignored move_all in {control_mode} mode")
+        socketio.emit('backend_error', {
+            'message': f'位置目标更新已拒绝: 当前是 {control_mode} 模式'
+        })
+        return
     if isinstance(data, dict) and 'positions' in data:
         with target_lock:
             flat = data['positions']
@@ -1639,6 +1729,12 @@ def ws_move_all(data):
 
 @socketio.on('move_group')
 def ws_move_group(data):
+    if not _position_target_updates_allowed():
+        print(f"[Move] ignored move_group in {control_mode} mode")
+        socketio.emit('backend_error', {
+            'message': f'位置目标更新已拒绝: 当前是 {control_mode} 模式'
+        })
+        return
     gname = data.get('group')
     positions_list = data.get('positions', [])
     ginfo = config.get('groups', {}).get(gname)
@@ -1658,6 +1754,12 @@ def ws_move_group(data):
 
 @socketio.on('home')
 def ws_home(data=None):
+    if not _position_target_updates_allowed():
+        print(f"[Home] ignored in {control_mode} mode")
+        socketio.emit('backend_error', {
+            'message': f'回零已拒绝: 当前是 {control_mode} 模式'
+        })
+        return
     with target_lock:
         for i in range(1, MOTOR_COUNT + 1):
             targets[i] = 0.0
@@ -1666,6 +1768,12 @@ def ws_home(data=None):
 @socketio.on('reset_all')
 def ws_reset_all(data=None):
     """Reset all joints to zero position."""
+    if not _position_target_updates_allowed():
+        print(f"[Reset] ignored in {control_mode} mode")
+        socketio.emit('backend_error', {
+            'message': f'复位已拒绝: 当前是 {control_mode} 模式'
+        })
+        return
     with target_lock:
         for i in range(1, MOTOR_COUNT + 1):
             targets[i] = 0.0

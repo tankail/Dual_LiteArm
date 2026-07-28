@@ -5,7 +5,7 @@ This module mirrors the verified C++ examples:
   gravity:   tau = G(q)
   impedance: tau = G(q) + Kp * (q_target - q) - Kd * dq
 
-MIT commands are sent as pos=0, vel=0, torque=tau, kp=0, kd=0.
+MIT commands are sent with the current position, vel=0, torque=tau, kp=0, kd=0.
 """
 
 import copy
@@ -43,6 +43,9 @@ RIGHT_GRAVITY_GAIN = np.array([1.0, 1.2, 1.0, 0.8, 1.0, 1.0, 1.0])
 DEFAULT_KP = np.array([6.0, 12.0, 12.0, 4.5, 3.0, 1.5, 1.2])
 DEFAULT_KD = np.array([0.9, 1.2, 1.2, 0.6, 0.375, 0.225, 0.15])
 DEFAULT_TORQUE_LIMIT = np.array([15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0])
+DEFAULT_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.05
+DEFAULT_FEEDBACK_JUMP_TOLERANCE_RAD = 0.35
+DEFAULT_FEEDBACK_JUMP_VELOCITY_SCALE = 4.0
 
 
 def _as_float_array(values: Iterable[float], size: int, name: str) -> np.ndarray:
@@ -276,6 +279,52 @@ class DualLiteArmPython:
         self.manager: Optional[MultiMotorManager] = None
         self.left_ids = arm_motor_ids(self.config, "left")
         self.right_ids = arm_motor_ids(self.config, "right")
+        self.joint_limits = {}
+        for side in ("left", "right"):
+            group = self.config.get("groups", {}).get(side, {})
+            limits = group.get("joint_limits", {})
+            lower = _as_float_array(
+                limits.get("lower", [-100.0] * 7),
+                7,
+                f"{side}.joint_limits.lower",
+            )
+            upper = _as_float_array(
+                limits.get("upper", [100.0] * 7),
+                7,
+                f"{side}.joint_limits.upper",
+            )
+            if np.any(lower >= upper):
+                raise ValueError(f"{side}.joint_limits lower must be below upper")
+            self.joint_limits[side] = (lower, upper)
+
+        control_cfg = self.config.get("control", {})
+        self.feedback_limit_tolerance_rad = float(
+            control_cfg.get(
+                "feedback_limit_tolerance_rad",
+                DEFAULT_FEEDBACK_LIMIT_TOLERANCE_RAD,
+            )
+        )
+        self.feedback_jump_tolerance_rad = float(
+            control_cfg.get(
+                "feedback_jump_tolerance_rad",
+                DEFAULT_FEEDBACK_JUMP_TOLERANCE_RAD,
+            )
+        )
+        self.feedback_jump_velocity_scale = float(
+            control_cfg.get(
+                "feedback_jump_velocity_scale",
+                DEFAULT_FEEDBACK_JUMP_VELOCITY_SCALE,
+            )
+        )
+        if self.feedback_limit_tolerance_rad < 0.0:
+            raise ValueError("feedback_limit_tolerance_rad must be non-negative")
+        if self.feedback_jump_tolerance_rad <= 0.0:
+            raise ValueError("feedback_jump_tolerance_rad must be positive")
+        if self.feedback_jump_velocity_scale < 0.0:
+            raise ValueError("feedback_jump_velocity_scale must be non-negative")
+        self._feedback_prev_q: Optional[Dict[str, np.ndarray]] = None
+        self._feedback_prev_time: Optional[float] = None
+        self._feedback_fault: Optional[str] = None
         self.motor_count = max(
             gid
             for group in self.config.get("groups", {}).values()
@@ -312,6 +361,9 @@ class DualLiteArmPython:
         self.config = cfg
         port_motor_types = build_port_motor_types(cfg)
         self.manager = MultiMotorManager(cfg["ports"], port_motor_types)
+        self._feedback_prev_q = None
+        self._feedback_prev_time = None
+        self._feedback_fault = None
         print(f"Opening {len(cfg['ports'])} serial ports for {self.motor_count} motors")
         self.manager.open_all()
         self.manager.init_all()
@@ -342,10 +394,25 @@ class DualLiteArmPython:
             if state is None:
                 continue
             index = gid - 1
-            if abs(state.pos) < 100.0:
+            if int(state.fault) != 0 and self._feedback_fault is None:
+                self._feedback_fault = (
+                    f"motor fault for global motor ID {gid}: "
+                    f"fault=0x{int(state.fault):02x}, mode={int(state.mode)}"
+                )
+            if (
+                np.isfinite(state.pos)
+                and np.isfinite(state.vel)
+                and np.isfinite(state.torque)
+                and abs(state.pos) < 100.0
+            ):
                 self.positions[index] = state.pos
                 self.velocities[index] = state.vel
                 self.torques[index] = state.torque
+            elif self._feedback_fault is None:
+                self._feedback_fault = (
+                    f"invalid feedback for global motor ID {gid}: "
+                    f"pos={state.pos}, vel={state.vel}, torque={state.torque}"
+                )
         return self.positions.copy(), self.velocities.copy()
 
     def arm_ids(self, side: str) -> List[int]:
@@ -362,9 +429,57 @@ class DualLiteArmPython:
         return np.array([self.velocities[gid - 1] for gid in self.arm_ids(side)])
 
     def validate_arms(self) -> None:
+        if self._feedback_fault is not None:
+            raise RuntimeError(self._feedback_fault)
+
+        now = time.monotonic()
+        current_q = {}
         for side in ("left", "right"):
-            if not valid_vector(self.arm_q(side), 7) or not valid_vector(self.arm_dq(side), 7):
+            q = self.arm_q(side)
+            dq = self.arm_dq(side)
+            if not valid_vector(q, 7) or not valid_vector(dq, 7):
                 raise RuntimeError(f"invalid {side} arm state")
+
+            lower, upper = self.joint_limits[side]
+            safe_lower = lower - self.feedback_limit_tolerance_rad
+            safe_upper = upper + self.feedback_limit_tolerance_rad
+            outside = np.flatnonzero((q < safe_lower) | (q > safe_upper))
+            if outside.size:
+                joint = int(outside[0])
+                gid = self.arm_ids(side)[joint]
+                raise RuntimeError(
+                    f"{side} j{joint + 1} feedback out of limits: "
+                    f"q={q[joint]:.4f} rad, allowed=[{safe_lower[joint]:.4f}, "
+                    f"{safe_upper[joint]:.4f}] rad, global_id={gid}"
+                )
+            current_q[side] = q
+
+        if self._feedback_prev_q is not None and self._feedback_prev_time is not None:
+            dt = max(now - self._feedback_prev_time, 1.0e-3)
+            for side in ("left", "right"):
+                q = current_q[side]
+                dq = self.arm_dq(side)
+                delta = np.abs(q - self._feedback_prev_q[side])
+                allowed = (
+                    self.feedback_jump_tolerance_rad
+                    + self.feedback_jump_velocity_scale * np.abs(dq) * dt
+                )
+                abnormal = np.flatnonzero(delta > allowed)
+                if abnormal.size:
+                    joint = int(abnormal[0])
+                    gid = self.arm_ids(side)[joint]
+                    raise RuntimeError(
+                        f"{side} j{joint + 1} feedback jump: "
+                        f"previous={self._feedback_prev_q[side][joint]:.4f} rad, "
+                        f"current={q[joint]:.4f} rad, delta={delta[joint]:.4f} rad, "
+                        f"dq={dq[joint]:.4f} rad/s, dt={dt:.4f} s, "
+                        f"global_id={gid}"
+                    )
+
+        self._feedback_prev_q = {
+            side: values.copy() for side, values in current_q.items()
+        }
+        self._feedback_prev_time = now
 
     def compute_gravity(self, side: str, q: Optional[Iterable[float]] = None) -> np.ndarray:
         q_values = self.arm_q(side) if q is None else q
@@ -395,10 +510,20 @@ class DualLiteArmPython:
         if self.manager is None:
             raise RuntimeError("controller is not open")
         command = {}
-        for gid, torque in zip(self.left_ids, _as_float_array(left_torque, 7, "left_torque")):
-            command[gid] = (0.0, 0.0, float(torque), 0.0, 0.0)
-        for gid, torque in zip(self.right_ids, _as_float_array(right_torque, 7, "right_torque")):
-            command[gid] = (0.0, 0.0, float(torque), 0.0, 0.0)
+        left_q = self.arm_q("left")
+        right_q = self.arm_q("right")
+        for gid, position, torque in zip(
+            self.left_ids,
+            left_q,
+            _as_float_array(left_torque, 7, "left_torque"),
+        ):
+            command[gid] = (float(position), 0.0, float(torque), 0.0, 0.0)
+        for gid, position, torque in zip(
+            self.right_ids,
+            right_q,
+            _as_float_array(right_torque, 7, "right_torque"),
+        ):
+            command[gid] = (float(position), 0.0, float(torque), 0.0, 0.0)
         self.manager.set_all_pos_vel_torque_kp_kd(command)
 
     def print_summary(self) -> None:
@@ -413,3 +538,11 @@ class DualLiteArmPython:
             print(f"[{side}] Kp: {format_vector(dyn.kp)}")
             print(f"[{side}] Kd: {format_vector(dyn.kd)}")
             print(f"[{side}] torque limit: {format_vector(dyn.torque_limit)}")
+            lower, upper = self.joint_limits[side]
+            print(f"[{side}] joint lower limit: {format_vector(lower)}")
+            print(f"[{side}] joint upper limit: {format_vector(upper)}")
+        print(
+            "feedback safety: joint limits + jump detection "
+            f"(limit_tol={self.feedback_limit_tolerance_rad:.3f} rad, "
+            f"jump_base={self.feedback_jump_tolerance_rad:.3f} rad)"
+        )
