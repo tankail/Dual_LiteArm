@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${ROOT_DIR}/robot_param/litearm_full.yaml"
 MODE="live"
 PORT="5001"
+export LITEARM_SCRIPT_DIR="${LITEARM_SCRIPT_DIR:-${ROOT_DIR}/litearm_python}"
 
 fail() {
   printf '\nERROR: %s\n' "$*" >&2
@@ -80,11 +81,13 @@ cd "${ROOT_DIR}"
 if [[ "${MODE}" == "demo" ]]; then
   echo "Starting LiteArm backend in DEMO mode on http://localhost:${PORT}"
   echo "Config: ${CONFIG}"
+  echo "Control scripts: ${LITEARM_SCRIPT_DIR}"
   exec conda run --no-capture-output -n "${ENV_NAME}" python app.py \
     --demo --port "${PORT}" --config "${CONFIG}"
 fi
 
 echo "Starting LiteArm backend in LIVE mode on http://localhost:${PORT}"
 echo "Config: ${CONFIG}"
+echo "Control scripts: ${LITEARM_SCRIPT_DIR}"
 exec conda run --no-capture-output -n "${ENV_NAME}" python app.py \
   --config "${CONFIG}" --port "${PORT}"

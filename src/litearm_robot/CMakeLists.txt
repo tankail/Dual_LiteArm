@@ -88,6 +88,7 @@ install(DIRECTORY msg/motor_msg/ DESTINATION include/motor_msg
     FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY scripts DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY robot_param/ DESTINATION share/litearm_robot/robot_param
     FILES_MATCHING PATTERN "*.yaml")
 install(DIRECTORY urdf/ DESTINATION share/litearm_robot/urdf
@@ -132,6 +133,18 @@ if(pinocchio_FOUND)
   add_executable(left_arm_gravity_compensation examples/left_arm_gravity_compensation.cpp)
   target_link_libraries(left_arm_gravity_compensation litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
 
+  message(STATUS "Building dual_arm_gravity_compensation example")
+  add_executable(dual_arm_gravity_compensation examples/dual_arm_gravity_compensation.cpp)
+  target_link_libraries(dual_arm_gravity_compensation litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
+
+  message(STATUS "Building dual_arm_impedance_compensation example")
+  add_executable(dual_arm_impedance_compensation examples/dual_arm_impedance_compensation.cpp)
+  target_link_libraries(dual_arm_impedance_compensation litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
+
+  message(STATUS "Building dual_arm_impedance_calc example (diagnostic only)")
+  add_executable(dual_arm_impedance_calc examples/dual_arm_impedance_calc.cpp)
+  target_link_libraries(dual_arm_impedance_calc litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
+
   message(STATUS "Building left_arm_teleop_force_feedback_dob example")
   add_executable(left_arm_teleop_force_feedback_dob examples/left_arm_teleop_force_feedback_dob.cpp)
   target_link_libraries(left_arm_teleop_force_feedback_dob litearm_robot pinocchio::pinocchio ament_index_cpp::ament_index_cpp)
@@ -167,6 +180,9 @@ if(pinocchio_FOUND)
       right_arm_gravity_calc
       left_arm_gravity_compensation
       left_arm_gravity_calc
+      dual_arm_gravity_compensation
+      dual_arm_impedance_compensation
+      dual_arm_impedance_calc
       left_arm_teleop_force_feedback_dob
       left_arm_joint_angle
       dual_arm_aging_test

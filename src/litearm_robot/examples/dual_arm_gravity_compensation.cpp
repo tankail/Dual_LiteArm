@@ -176,19 +176,27 @@ int main(int argc, char** argv)
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
 
-        std::string left_config = ament_index_cpp::get_package_share_directory("litearm_config")
-            + "/robot_param/litearm_left_arm.yaml";
-        std::string right_config = ament_index_cpp::get_package_share_directory("litearm_config")
-            + "/robot_param/litearm_right_arm.yaml";
-        std::string left_urdf = ament_index_cpp::get_package_share_directory("litearm_robot")
-            + "/urdf/LiteArm_A10_251224_left_arm.urdf";
-        std::string right_urdf = ament_index_cpp::get_package_share_directory("litearm_robot")
-            + "/urdf/LiteArm_A10_251224_right_arm.urdf";
-
-        if (argc > 1) left_config = argv[1];
-        if (argc > 2) right_config = argv[2];
-        if (argc > 3) left_urdf = argv[3];
-        if (argc > 4) right_urdf = argv[4];
+        std::string left_config;
+        std::string right_config;
+        std::string left_urdf;
+        std::string right_urdf;
+        if (argc > 4) {
+            // The backend passes absolute paths, so no local ament overlay is
+            // required when this executable is started from the web server.
+            left_config = argv[1];
+            right_config = argv[2];
+            left_urdf = argv[3];
+            right_urdf = argv[4];
+        } else {
+            left_config = ament_index_cpp::get_package_share_directory("litearm_config")
+                + "/robot_param/litearm_left_arm.yaml";
+            right_config = ament_index_cpp::get_package_share_directory("litearm_config")
+                + "/robot_param/litearm_right_arm.yaml";
+            left_urdf = ament_index_cpp::get_package_share_directory("litearm_robot")
+                + "/urdf/LiteArm_A10_251224_left_arm.urdf";
+            right_urdf = ament_index_cpp::get_package_share_directory("litearm_robot")
+                + "/urdf/LiteArm_A10_251224_right_arm.urdf";
+        }
 
         const std::vector<double> tau_limit = {15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0};
         const std::vector<double> left_gain = {0.85, 1.0, 1.0, 0.8, 1.0, 1.0, 1.0};

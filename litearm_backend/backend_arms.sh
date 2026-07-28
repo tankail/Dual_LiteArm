@@ -3,4 +3,5 @@
 # Usage: ./backend_arms.sh [--demo] [--port PORT]
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LITEARM_SCRIPT_DIR="${ROOT_DIR}/litearm_python"
 exec "${ROOT_DIR}/backend.sh" --config "${ROOT_DIR}/robot_param/litearm_arms.yaml" "$@"

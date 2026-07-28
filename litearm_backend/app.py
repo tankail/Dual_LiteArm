@@ -76,8 +76,10 @@ script_name = None
 script_output_lines = []
 script_output_lock = threading.Lock()
 SCRIPT_OUTPUT_LIMIT = 1000
-SCRIPT_DIR = os.path.normpath(os.path.join(
-    BACKEND_DIR, '..', 'src', 'litearm_robot', 'scripts'))
+SCRIPT_DIR = os.path.abspath(os.environ.get(
+    'LITEARM_SCRIPT_DIR',
+    os.path.join(BACKEND_DIR, 'litearm_python')))
+SCRIPT_RUNNER = os.path.join(BACKEND_DIR, 'run_script.py')
 
 
 def init_arrays(motor_count):
@@ -101,10 +103,10 @@ torques = np.array([], dtype=np.float64)
 connected = False
 backend_serial_fault = False
 backend_serial_fault_message = ""
-gravity_process = None  # External C++ gravity runner process
+gravity_process = None  # External Python gravity script process
 gravity_serial_released = False
 gravity_transitioning = False
-impedance_process = None  # External C++ joint-space impedance process
+impedance_process = None  # External Python joint-space impedance process
 impedance_serial_released = False
 impedance_transitioning = False
 active_config_path = None
@@ -573,7 +575,7 @@ def _set_impedance_targets_from_positions():
 
 
 def _gravity_runner_path():
-    return os.path.join(BACKEND_DIR, 'gravity_compensation_runner.py')
+    return SCRIPT_RUNNER
 
 
 def _is_gravity_runner_alive():
@@ -591,15 +593,15 @@ def _release_robot_for_external_gravity():
                 backend_serial_fault = False
                 backend_serial_fault_message = ""
             return
-        # Do not send STOP here. STOP disables the motor torque before the C++
-        # gravity process has opened the ports, which is exactly the drop seen
+        # Do not send STOP here. STOP disables the motor torque before the
+        # gravity script has opened the ports, which causes the arm to drop
         # when switching from position mode.
         try:
             current_robot.close_all()
         except Exception:
             pass
         # A closed manager must not remain visible to the broadcast/control
-        # threads while the external C++ process owns the serial ports.
+        # threads while the external Python script owns the serial ports.
         robot = None
         gravity_serial_released = True
         backend_serial_fault = False
@@ -638,13 +640,17 @@ def _start_external_gravity():
     global gravity_process, control_mode, gravity_transitioning
     with mode_transition_lock:
         if demo_mode:
-            return False, "demo mode does not use external gravity compensation"
+            return False, "demo mode does not use hardware gravity compensation"
+        if _script_is_alive():
+            return False, f"script already running: {script_name}"
         if _is_gravity_runner_alive():
             return True, None
 
         runner = _gravity_runner_path()
         if not os.path.exists(runner):
-            return False, f"gravity runner not found: {runner}"
+            return False, f"mode script runner not found: {runner}"
+        if not active_config_path:
+            return False, "active robot config is not available"
 
         gravity_transitioning = True
 
@@ -655,7 +661,13 @@ def _start_external_gravity():
             control_mode = 'gravity_comp'
             _release_robot_for_external_gravity()
             gravity_process = subprocess.Popen(
-                [sys.executable, runner, '--side', 'both'],
+                [
+                    sys.executable,
+                    runner,
+                    '--config',
+                    active_config_path,
+                    '2_gravity_compensation_control.py',
+                ],
                 cwd=BACKEND_DIR,
                 stdout=None,
                 stderr=None,
@@ -668,7 +680,11 @@ def _start_external_gravity():
                 restored = _restore_robot_after_external_gravity()
                 control_mode = 'position' if restored else 'free'
                 return False, f"gravity runner exited immediately with code {code}"
-            print(f"[Gravity] External C++ runner started, pid={gravity_process.pid}")
+            print(
+                "[Gravity] External Python script started, "
+                f"pid={gravity_process.pid}, "
+                "script=2_gravity_compensation_control.py"
+            )
             return True, None
         except Exception as exc:
             gravity_process = None
@@ -709,7 +725,7 @@ def _stop_external_gravity(restore_robot=True):
 
 
 def _impedance_runner_path():
-    return os.path.join(BACKEND_DIR, 'impedance_compensation_runner.py')
+    return SCRIPT_RUNNER
 
 
 def _is_impedance_runner_alive():
@@ -727,8 +743,8 @@ def _release_robot_for_external_impedance():
                 backend_serial_fault = False
                 backend_serial_fault_message = ""
             return
-        # Keep the last position-hold command alive until the C++ process takes
-        # the port. Sending STOP here makes impedance entry unsafe.
+        # Keep the last position-hold command alive until the Python script
+        # takes the port. Sending STOP here makes impedance entry unsafe.
         try:
             current_robot.close_all()
         except Exception:
@@ -774,13 +790,17 @@ def _start_external_impedance(skip_backend_handoff=False):
     global impedance_serial_released, gravity_serial_released
     with mode_transition_lock:
         if demo_mode:
-            return False, "demo mode does not use external impedance control"
+            return False, "demo mode does not use hardware impedance control"
+        if _script_is_alive():
+            return False, f"script already running: {script_name}"
         if _is_impedance_runner_alive():
             return True, None
 
         runner = _impedance_runner_path()
         if not os.path.exists(runner):
-            return False, f"impedance runner not found: {runner}"
+            return False, f"mode script runner not found: {runner}"
+        if not active_config_path:
+            return False, "active robot config is not available"
 
         owns_transition = not impedance_transitioning
         if owns_transition:
@@ -789,13 +809,14 @@ def _start_external_impedance(skip_backend_handoff=False):
             left_target = None
             right_target = None
             if skip_backend_handoff:
-                # Gravity C++ has just released the ports. Keep ownership on
-                # the C++ side and let impedance latch q_target directly.
+                # Gravity Python has just released the ports. Keep ownership
+                # on the mode-script side and let impedance latch q_target
+                # directly from its first state read.
                 control_mode = 'impedance'
                 impedance_serial_released = True
             else:
                 # Capture q_target before releasing the backend serial handle
-                # and pass it explicitly to C++; never re-latch after a gap.
+                # and pass it explicitly to the Python script.
                 current = _snapshot_live_positions()
                 left_target = _arm_target_from_snapshot(current, 'left')
                 right_target = _arm_target_from_snapshot(current, 'right')
@@ -806,7 +827,11 @@ def _start_external_impedance(skip_backend_handoff=False):
                 control_mode = 'impedance'
                 _release_robot_for_external_impedance()
             command = [
-                sys.executable, runner,
+                sys.executable,
+                runner,
+                '--config',
+                active_config_path,
+                'dual_arm_impedance_compensation.py',
             ]
             if left_target is not None and right_target is not None:
                 command.extend([
@@ -834,10 +859,12 @@ def _start_external_impedance(skip_backend_handoff=False):
             if skip_backend_handoff:
                 gravity_serial_released = False
             print(
-                "[Impedance] External C++ runner started, "
+                "[Impedance] External Python script started, "
                 f"pid={impedance_process.pid}, "
-                + ("target latched in C++ after Gravity handoff"
-                   if skip_backend_handoff else "target latched from backend"))
+                + ("target latched in Python after Gravity handoff"
+                   if skip_backend_handoff else "target latched from backend")
+                + ", script=dual_arm_impedance_compensation.py"
+            )
             return True, None
         except Exception as exc:
             impedance_process = None
@@ -854,7 +881,7 @@ def _start_external_impedance(skip_backend_handoff=False):
 
 
 def _switch_gravity_to_impedance():
-    """Hand serial ownership directly from Gravity C++ to Impedance C++."""
+    """Hand serial ownership directly from Gravity Python to Impedance Python."""
     global impedance_transitioning
     with mode_transition_lock:
         if not gravity_serial_released:
@@ -863,6 +890,15 @@ def _switch_gravity_to_impedance():
         impedance_transitioning = True
         try:
             print("[Impedance] Direct Gravity -> Impedance handoff")
+            # Tell the Gravity script not to send STOP in its finally block.
+            # The last gravity MIT command stays active until the Impedance
+            # script opens the ports and sends its first torque command.
+            if gravity_process is not None and gravity_process.poll() is None:
+                try:
+                    os.killpg(gravity_process.pid, signal.SIGUSR1)
+                    time.sleep(0.05)
+                except Exception as exc:
+                    print(f"[Impedance] Gravity handoff signal failed: {exc}")
             _stop_external_gravity(restore_robot=False)
             return _start_external_impedance(skip_backend_handoff=True)
         finally:
@@ -930,7 +966,7 @@ def _discover_scripts():
     for filename in sorted(os.listdir(SCRIPT_DIR)):
         if not filename.endswith('.py') or filename.startswith('__'):
             continue
-        if filename == 'litearm_demo_common.py':
+        if filename in ('litearm_demo_common.py', 'litearm_control.py'):
             continue
         full_path = os.path.join(SCRIPT_DIR, filename)
         if not os.path.isfile(full_path):
@@ -955,19 +991,9 @@ def _resolve_script_path(script):
 
 
 def _script_needs_execute(filename):
-    # The web panel sends no CLI flags. Keep reset-zero dry by default, while
-    # allowing movement/control examples to behave like Panthera demos.
-    safe_without_execute = {
-        '0_robot_get_state.py',
-        '0_robot_set_zero.py',
-        '0_robot_free_mode.py',
-        '1_Joint_PD_hold.py',
-        '1_forward_kinematics_test.py',
-        '1_inverse_kinematics_test.py',
-        '5_record_trajectory.py',
-        '2_gravity_compensation_control.py',
-    }
-    return filename not in safe_without_execute
+    # LiteArm scripts expose their own arguments. Keep this hook for API
+    # compatibility, but do not append Panthera's --execute flag.
+    return False
 
 
 def _watch_script_process(proc, name):
@@ -1017,15 +1043,19 @@ def _start_script(script):
         control_mode = 'script'
         _release_robot_for_external_gravity()
 
-        cmd = [sys.executable, script_path, '--config', active_config_path]
-        if _script_needs_execute(script_filename):
-            cmd.append('--execute')
+        cmd = [
+            sys.executable,
+            SCRIPT_RUNNER,
+            '--config',
+            active_config_path,
+            script_filename,
+        ]
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
         env['PYTHONPATH'] = TEACH_DIR + os.pathsep + env.get('PYTHONPATH', '')
         script_process = subprocess.Popen(
             cmd,
-            cwd=os.path.dirname(script_path),
+            cwd=BACKEND_DIR,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1100,12 +1130,12 @@ def control_loop():
                 pass
 
             elif control_mode == 'gravity_comp':
-                # External C++ examples own the serial ports in this mode.
+                # The external Python mode script owns the serial ports.
                 if (gravity_serial_released and not gravity_transitioning
                         and not impedance_transitioning
                         and not _is_gravity_runner_alive()
                         and not _script_is_alive()):
-                    print("[Gravity] External runner stopped unexpectedly; restoring backend serial")
+                    print("[Gravity] External script stopped unexpectedly; restoring backend serial")
                     restored = _stop_external_gravity(restore_robot=True)
                     control_mode = 'position' if restored else 'free'
                 pass
@@ -1115,10 +1145,10 @@ def control_loop():
                 pass
 
             elif control_mode == 'impedance':
-                # The verified C++ controller owns both serial ports.
+                # The Python impedance script owns both serial ports.
                 if (impedance_serial_released and not impedance_transitioning
                         and not _is_impedance_runner_alive()):
-                    print("[Impedance] External runner stopped unexpectedly; restoring backend serial")
+                    print("[Impedance] External script stopped unexpectedly; restoring backend serial")
                     restored = _stop_external_impedance(restore_robot=True)
                     control_mode = 'position' if restored else 'free'
 
@@ -1685,7 +1715,7 @@ def ws_gravity_comp(data=None):
             })
             return
         control_mode = 'gravity_comp'
-        print("[Gravity] Compensation ENABLED via C++ runner")
+        print("[Gravity] Compensation ENABLED via Python script")
     else:
         restored = True
         if control_mode == 'gravity_comp':
@@ -1749,7 +1779,7 @@ def ws_set_mode(data):
                 mode = 'free'
         control_mode = mode
         if mode == 'gravity_comp':
-            print("[Gravity] Compensation ENABLED via C++ runner")
+            print("[Gravity] Compensation ENABLED via Python script")
         elif mode == 'impedance':
             print("[Impedance] Joint-space G(q)+Kp(qd-q)-Kd*dq ENABLED")
         elif mode == 'free':

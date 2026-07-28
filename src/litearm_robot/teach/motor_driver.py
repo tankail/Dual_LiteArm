@@ -40,11 +40,32 @@ MODE_MOTOR_VERSION       = 0x0B
 MODE_FUN_V               = 0x0C
 MODE_FDCAN_RESET         = 0x0E
 MODE_FDCAN_MOTOR_STATE   = 0x0F
+MODE_TQE_ADJS_FLAG       = 0x10
 MODE_FDCAN_MOTOR_STATE2  = 0x11
 
 FRAME_HEADER   = 0xF7
 MY_2PI         = 6.28318530717
 SENTINEL_INT16 = -32768
+
+# Must match motor_tqe_adj in src/litearm_robot/include/hardware/motor.hpp.
+# The C++ driver converts torque as: int16 = torque / (adjust * 0.01).
+MOTOR_TQE_ADJ = {
+    "3536_32": 0.4581,
+    "5046_20": 0.5280,
+    "4538_19": 0.4450,
+    "5047_9": 0.5330,
+    "5047_36": 0.4938,
+    "5047_36_2": 0.8030,
+    "4438_30": 0.5256,
+    "4438_32": 0.5584,
+    "6056_36": 0.6770,
+    "7256_35": 0.6770,
+    "60SG_35": 0.7942,
+    "60BM_35": 0.7942,
+    "5043_20": 0.9660,
+    "General": 0.5000,
+    "NONE": 1.0000,
+}
 
 def _ver(maj, mn, pat): return (maj << 12) | (mn << 4) | pat
 
@@ -122,11 +143,13 @@ class MotorState(NamedTuple):
 class MotorDriver:
     """单个串口上的电机驱动"""
 
-    def __init__(self, port: str, motor_ids: list, baudrate=4000000):
+    def __init__(self, port: str, motor_ids: list, baudrate=4000000,
+                 motor_types=None):
         self.port = port
         self.motor_ids = sorted(motor_ids)
         self.id_max = max(motor_ids) if motor_ids else 1
         self.num_motors = len(motor_ids)
+        self.motor_types = {int(k): str(v) for k, v in (motor_types or {}).items()}
         self._lock = threading.Lock()
         self._ser = serial.Serial()
         self._ser.port = port
@@ -137,6 +160,9 @@ class MotorDriver:
         self._board_version = 0
         self._fun_v_confirmed = False
         self._motor_versions = {}
+        # 0xff means the controller has not replied yet.  Flag 1 means
+        # torque correction is already performed inside the motor firmware.
+        self._torque_adjust_flags = {mid: 0xFF for mid in motor_ids}
         # 本地ID → 状态
         self._states = {mid: MotorState(999,0,0,0,0) for mid in motor_ids}
 
@@ -197,7 +223,67 @@ class MotorDriver:
                 self._send_raw(MODE_FUN_V, struct.pack('<B', fun_v)); time.sleep(0.02)
                 if self._fun_v_confirmed: break
 
+            # Match the C++ SDK.  Newer motor firmware may already apply
+            # the model-specific torque correction internally.
+            if self._board_version >= _ver(4, 7, 0) and mv >= _ver(4, 6, 0):
+                self.check_torque_adjustment()
+
         print(f"  {self.port}: 初始化完成")
+
+    def request_torque_adjustment_flags(self):
+        """Request the firmware torque-correction flag for every local motor."""
+        # The C++ SDK repeats this request three times because it is sent
+        # through the CAN board broadcast path.
+        for _ in range(3):
+            self._send_raw(MODE_TQE_ADJS_FLAG, b'\x7F')
+
+    def check_torque_adjustment(self):
+        """Mirror robot::check_tqe_adjust_flag() from the C++ SDK."""
+        print(f"  {self.port}: Check the torque adjustment mark...")
+        for _ in range(20):
+            self.request_torque_adjustment_flags()
+            time.sleep(0.1)
+            unresolved = [
+                mid for mid in self.motor_ids
+                if self._motor_versions.get(mid, (0, 0, 0)) >= (4, 6, 0)
+                and self._torque_adjust_flags.get(mid, 0xFF) == 0xFF
+            ]
+            if not unresolved:
+                break
+
+        unresolved = [
+            mid for mid in self.motor_ids
+            if self._motor_versions.get(mid, (0, 0, 0)) >= (4, 6, 0)
+            and self._torque_adjust_flags.get(mid, 0xFF) == 0xFF
+        ]
+        if unresolved:
+            print(
+                f"  {self.port}: warning - torque adjustment flag unavailable "
+                f"for local IDs {unresolved}; keeping configured coefficients"
+            )
+
+        internal = []
+        for mid in self.motor_ids:
+            if self._torque_adjust_flags.get(mid) == 1:
+                self.motor_types[mid] = "NONE"
+                internal.append(mid)
+        if internal:
+            print(
+                f"  {self.port}: internal torque correction enabled for "
+                f"local IDs {internal}"
+            )
+
+        effective = []
+        for mid in self.motor_ids:
+            flag = self._torque_adjust_flags.get(mid, 0xFF)
+            motor_type = self.motor_types.get(mid, "NONE")
+            adjustment = MOTOR_TQE_ADJ.get(
+                motor_type, MOTOR_TQE_ADJ["NONE"])
+            effective.append(
+                f"ID={mid}: flag={flag}, type={motor_type}, "
+                f"adj={adjustment:.4f}"
+            )
+        print(f"  {self.port}: torque conversion: " + "; ".join(effective))
 
     def close(self):
         self._running = False
@@ -210,6 +296,19 @@ class MotorDriver:
     def _v2i(self, r): return self._i16(r / MY_2PI * 4000)
     def _i2p(self, v): return v * MY_2PI / 10000.0
     def _i2v(self, v): return v * MY_2PI / 4000.0
+    def _tqe_adj(self, local_id):
+        motor_type = self.motor_types.get(int(local_id), "NONE")
+        return MOTOR_TQE_ADJ.get(motor_type, MOTOR_TQE_ADJ["NONE"])
+    def _tqe2i(self, torque, local_id):
+        return self._i16(float(torque) / (self._tqe_adj(local_id) * 0.01))
+    def _i2tqe(self, value, local_id):
+        return float(value) * (self._tqe_adj(local_id) * 0.01)
+    def _pid_scale(self, value, local_id):
+        return float(value) / self._tqe_adj(local_id)
+    def _kp2i(self, kp, local_id):
+        return self._i16(self._pid_scale(kp, local_id) * 10.0 * MY_2PI)
+    def _kd2i(self, kd, local_id):
+        return self._i16(self._pid_scale(kd, local_id) * 10.0 * MY_2PI)
 
     @staticmethod
     def _get_data_len(mode, id_max):
@@ -236,7 +335,19 @@ class MotorDriver:
         lb = struct.pack('<H', len(data))
         c8 = struct.pack('<B', crc8(cb + lb))
         c16 = struct.pack('<H', crc16(data))
-        with self._lock: self._ser.write(head + cb + lb + c8 + c16 + data)
+        frame = head + cb + lb + c8 + c16 + data
+        with self._lock:
+            if not self._ser or not self._ser.is_open:
+                raise serial.SerialException(f"{self.port} is not open")
+            try:
+                self._ser.write(frame)
+            except Exception:
+                try:
+                    if self._ser and self._ser.is_open:
+                        self._ser.close()
+                except Exception:
+                    pass
+                raise
 
     def _pad(self, cmd, payload):
         n = self._get_data_len(cmd, self.id_max) // 2
@@ -253,8 +364,29 @@ class MotorDriver:
             i = lid - 1
             payload[i*3+0] = self._p2i(pos)
             payload[i*3+1] = self._v2i(vel)
-            payload[i*3+2] = self._i16(max_torque / 0.01)  # 力矩转换
+            payload[i*3+2] = self._tqe2i(max_torque, lid)
         self._send_raw(MODE_POS_VEL_TQE, self._pad(MODE_POS_VEL_TQE, payload))
+
+    def set_position(self, local_id_to_pos: dict):
+        """MODE_POSITION (0x80): position-only control."""
+        payload = [SENTINEL_INT16] * self.id_max
+        for lid, pos in local_id_to_pos.items():
+            payload[lid - 1] = self._p2i(pos)
+        self._send_raw(MODE_POSITION, self._pad(MODE_POSITION, payload))
+
+    def set_velocity(self, local_id_to_vel: dict):
+        """MODE_VELOCITY (0x81): velocity-only control."""
+        payload = [SENTINEL_INT16] * self.id_max
+        for lid, vel in local_id_to_vel.items():
+            payload[lid - 1] = self._v2i(vel)
+        self._send_raw(MODE_VELOCITY, self._pad(MODE_VELOCITY, payload))
+
+    def set_torque(self, local_id_to_torque: dict):
+        """MODE_TORQUE (0x82): torque-only control."""
+        payload = [SENTINEL_INT16] * self.id_max
+        for lid, torque in local_id_to_torque.items():
+            payload[lid - 1] = self._tqe2i(torque, lid)
+        self._send_raw(MODE_TORQUE, self._pad(MODE_TORQUE, payload))
 
     def set_pos_vel_kp_kd(self, local_id_to_pvkd: dict):
         payload = [SENTINEL_INT16] * (self.id_max * 4)
@@ -262,8 +394,8 @@ class MotorDriver:
             i = lid - 1
             payload[i*4+0] = self._p2i(pos)
             payload[i*4+1] = self._v2i(vel)
-            payload[i*4+2] = self._i16(kp * 10 * MY_2PI)
-            payload[i*4+3] = self._i16(kd * 10 * MY_2PI)
+            payload[i*4+2] = self._kp2i(kp, lid)
+            payload[i*4+3] = self._kd2i(kd, lid)
         self._send_raw(MODE_POS_VEL_KP_KD, self._pad(MODE_POS_VEL_KP_KD, payload))
 
     def set_pos_vel_torque_kp_kd(self, local_id_to_pvtkd: dict):
@@ -273,13 +405,19 @@ class MotorDriver:
             i = lid - 1
             payload[i*5+0] = self._p2i(pos)
             payload[i*5+1] = self._v2i(vel)
-            payload[i*5+2] = self._i16(torque / 0.01)  # 力矩, 同 set_pos_vel_max_torque
-            payload[i*5+3] = self._i16(kp * 10 * MY_2PI)
-            payload[i*5+4] = self._i16(kd * 10 * MY_2PI)
+            payload[i*5+2] = self._tqe2i(torque, lid)
+            payload[i*5+3] = self._kp2i(kp, lid)
+            payload[i*5+4] = self._kd2i(kd, lid)
         self._send_raw(MODE_POS_VEL_TQE_KP_KD_2, self._pad(MODE_POS_VEL_TQE_KP_KD_2, payload))
 
     def set_free_mode(self):
         self.set_pos_vel_kp_kd({mid:(0,0,0,0) for mid in self.motor_ids})
+
+    def set_reset_zero(self):
+        """Reset all motors on this serial port to their zero position."""
+        for _ in range(3):
+            self._send_raw(MODE_RESET_ZERO, b"\x7f")
+            time.sleep(0.05)
 
     def request_state(self):
         # 仅用 MODE_MOTOR_STATE2 (0x0A) — 电机固件 v4.7+ 全部支持
@@ -330,6 +468,12 @@ class MotorDriver:
                 off=i*4; mid=data[off]
                 if mid in self._states:
                     self._motor_versions[mid] = (data[off+1],data[off+2],data[off+3])
+        elif cmd == MODE_TQE_ADJS_FLAG:
+            for i in range(len(data)//2):
+                off = i * 2
+                mid = data[off]
+                if mid in self._torque_adjust_flags:
+                    self._torque_adjust_flags[mid] = data[off + 1]
         elif cmd == MODE_MOTOR_STATE:
             # 旧格式: id(1) + pos(2) + vel(2) + tqe(2) = 7 bytes
             for i in range(len(data)//7):
@@ -339,7 +483,7 @@ class MotorDriver:
                 if mid in self._states:
                     p,v,t = struct.unpack_from('<hhh', data, off+1)
                     self._states[mid] = MotorState(pos=self._i2p(p), vel=self._i2v(v),
-                                                   torque=float(t), mode=0, fault=0)
+                                                   torque=self._i2tqe(t, mid), mode=0, fault=0)
         elif cmd == MODE_FDCAN_MOTOR_STATE:
             # FDCAN头(3) + 电机状态(7 each): fault(1)+tx_err(1)+rx_err(1)
             offs = 3
@@ -350,7 +494,7 @@ class MotorDriver:
                 if mid in self._states:
                     p,v,t = struct.unpack_from('<hhh', data, off+1)
                     self._states[mid] = MotorState(pos=self._i2p(p), vel=self._i2v(v),
-                                                   torque=float(t), mode=0, fault=0)
+                                                   torque=self._i2tqe(t, mid), mode=0, fault=0)
         elif cmd in (MODE_MOTOR_STATE2, MODE_FDCAN_MOTOR_STATE2):
             # MODE_MOTOR_STATE2: id(1)+mode(1)+fault(1)+pos(2)+vel(2)+tqe(2)=9
             # MODE_FDCAN_MOTOR_STATE2: FDCAN头(3)+电机状态(9 each)
@@ -362,7 +506,7 @@ class MotorDriver:
                 if mid in self._states:
                     p,v,t = struct.unpack_from('<hhh',data,off+3)
                     self._states[mid] = MotorState(pos=self._i2p(p), vel=self._i2v(v),
-                                                   torque=float(t), mode=data[off+1], fault=data[off+2])
+                                                   torque=self._i2tqe(t, mid), mode=data[off+1], fault=data[off+2])
         elif cmd == MODE_FUN_V:
             self._fun_v_confirmed = True
 
@@ -381,7 +525,7 @@ class MultiMotorManager:
         # 全局ID自动编排: ACM0→1-8 (左臂), ACM1→9-16 (右臂), ACM2→17-18 (腰), ACM3→19-20 (头)
     """
 
-    def __init__(self, port_motor_map: dict):
+    def __init__(self, port_motor_map: dict, port_motor_types: dict = None):
         """
         port_motor_map: {port_path: [local_motor_id, ...]}
         按端口顺序分配全局ID
@@ -393,7 +537,8 @@ class MultiMotorManager:
 
         gid = 1
         for port, local_ids in port_motor_map.items():
-            d = MotorDriver(port, list(local_ids))
+            type_map = (port_motor_types or {}).get(port, {})
+            d = MotorDriver(port, list(local_ids), motor_types=type_map)
             self.drivers.append(d)
             for lid in sorted(local_ids):
                 self._gid_to_port[gid] = (len(self.drivers) - 1, lid)
@@ -443,6 +588,21 @@ class MultiMotorManager:
         for drv_idx, lid_pvt in by_drv.items():
             self.drivers[drv_idx].set_pos_vel_max_torque(lid_pvt)
 
+    def set_all_position(self, gid_to_pos: dict):
+        by_drv = self._split_by_port(gid_to_pos)
+        for drv_idx, lid_pos in by_drv.items():
+            self.drivers[drv_idx].set_position(lid_pos)
+
+    def set_all_velocity(self, gid_to_vel: dict):
+        by_drv = self._split_by_port(gid_to_vel)
+        for drv_idx, lid_vel in by_drv.items():
+            self.drivers[drv_idx].set_velocity(lid_vel)
+
+    def set_all_torque(self, gid_to_torque: dict):
+        by_drv = self._split_by_port(gid_to_torque)
+        for drv_idx, lid_torque in by_drv.items():
+            self.drivers[drv_idx].set_torque(lid_torque)
+
     def set_all_pos_vel_kp_kd(self, gid_to_pvkd: dict):
         """
         gid_to_pvkd: {global_id: (pos, vel, kp, kd)}
@@ -462,6 +622,9 @@ class MultiMotorManager:
 
     def stop_all(self):
         for d in self.drivers: d.set_stop()
+
+    def reset_zero_all(self):
+        for d in self.drivers: d.set_reset_zero()
 
 
 def rad_to_deg(r): return r * 180.0 / 3.141592653589793
