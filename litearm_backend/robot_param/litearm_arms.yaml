@@ -75,6 +75,8 @@ control:
   impedance_loop_hz: 200
   broadcast_hz: 30
   home_timeout: 3.0
+  state_wait_after_request: 0.001
+  feedback_max_bad_samples: 5
 
 # 关节空间阻抗控制：
 # tau = G(q) + Kp * (q_target - q) - Kd * dq

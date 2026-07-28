@@ -93,3 +93,5 @@ control:
   gravity_loop_hz: 200
   broadcast_hz: 30
   home_timeout: 3.0          # 回零超时 (秒)
+  state_wait_after_request: 0.001
+  feedback_max_bad_samples: 5

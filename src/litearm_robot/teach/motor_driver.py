@@ -165,6 +165,9 @@ class MotorDriver:
         self._torque_adjust_flags = {mid: 0xFF for mid in motor_ids}
         # 本地ID → 状态
         self._states = {mid: MotorState(999,0,0,0,0) for mid in motor_ids}
+        # The RX thread updates multiple motors from one response frame.
+        # Keep frame updates and snapshots coherent for the control thread.
+        self._state_lock = threading.Lock()
 
     def open(self):
         print(f"  {self.port}: 打开串口...")
@@ -427,10 +430,12 @@ class MotorDriver:
         for _ in range(3): self._send_raw(MODE_STOP, b'\x7F')
 
     def get_local_state(self, local_id):
-        return self._states.get(local_id, MotorState(999,0,0,0,0))
+        with self._state_lock:
+            return self._states.get(local_id, MotorState(999,0,0,0,0))
 
     def get_all_local_states(self):
-        return dict(self._states)
+        with self._state_lock:
+            return dict(self._states)
 
     # ==================== 接收 ====================
     def _recv_loop(self):
@@ -476,39 +481,67 @@ class MotorDriver:
                     self._torque_adjust_flags[mid] = data[off + 1]
         elif cmd == MODE_MOTOR_STATE:
             # 旧格式: id(1) + pos(2) + vel(2) + tqe(2) = 7 bytes
+            updates = {}
             for i in range(len(data)//7):
                 off = i*7
                 if off+7 > len(data): break
                 mid = data[off]
                 if mid in self._states:
                     p,v,t = struct.unpack_from('<hhh', data, off+1)
-                    self._states[mid] = MotorState(pos=self._i2p(p), vel=self._i2v(v),
-                                                   torque=self._i2tqe(t, mid), mode=0, fault=0)
+                    updates[mid] = MotorState(
+                        pos=self._i2p(p),
+                        vel=self._i2v(v),
+                        torque=self._i2tqe(t, mid),
+                        mode=0,
+                        fault=0,
+                    )
+            self._store_state_updates(updates)
         elif cmd == MODE_FDCAN_MOTOR_STATE:
             # FDCAN头(3) + 电机状态(7 each): fault(1)+tx_err(1)+rx_err(1)
             offs = 3
+            updates = {}
             for i in range((len(data)-offs)//7):
                 off = offs + i*7
                 if off+7 > len(data): break
                 mid = data[off]
                 if mid in self._states:
                     p,v,t = struct.unpack_from('<hhh', data, off+1)
-                    self._states[mid] = MotorState(pos=self._i2p(p), vel=self._i2v(v),
-                                                   torque=self._i2tqe(t, mid), mode=0, fault=0)
+                    updates[mid] = MotorState(
+                        pos=self._i2p(p),
+                        vel=self._i2v(v),
+                        torque=self._i2tqe(t, mid),
+                        mode=0,
+                        fault=0,
+                    )
+            self._store_state_updates(updates)
         elif cmd in (MODE_MOTOR_STATE2, MODE_FDCAN_MOTOR_STATE2):
             # MODE_MOTOR_STATE2: id(1)+mode(1)+fault(1)+pos(2)+vel(2)+tqe(2)=9
             # MODE_FDCAN_MOTOR_STATE2: FDCAN头(3)+电机状态(9 each)
             offs = 3 if cmd == MODE_FDCAN_MOTOR_STATE2 else 0
+            updates = {}
             for i in range((len(data)-offs)//9):
                 off = offs + i*9
                 if off+9 > len(data): break
                 mid = data[off]
                 if mid in self._states:
                     p,v,t = struct.unpack_from('<hhh',data,off+3)
-                    self._states[mid] = MotorState(pos=self._i2p(p), vel=self._i2v(v),
-                                                   torque=self._i2tqe(t, mid), mode=data[off+1], fault=data[off+2])
+                    updates[mid] = MotorState(
+                        pos=self._i2p(p),
+                        vel=self._i2v(v),
+                        torque=self._i2tqe(t, mid),
+                        mode=data[off+1],
+                        fault=data[off+2],
+                    )
+            self._store_state_updates(updates)
         elif cmd == MODE_FUN_V:
             self._fun_v_confirmed = True
+
+    def _store_state_updates(self, updates):
+        """Publish one complete parsed feedback frame atomically."""
+        if not updates:
+            return
+        with self._state_lock:
+            self._states.update(updates)
 
 
 class MultiMotorManager:
@@ -572,9 +605,13 @@ class MultiMotorManager:
 
     def get_all_states(self) -> dict:
         """返回 {global_id: MotorState}"""
+        # Take one coherent snapshot per serial port before mapping local IDs
+        # to global IDs. Without this, the RX thread can update the dictionary
+        # between two motor reads and produce a mixed-time control state.
+        snapshots = [driver.get_all_local_states() for driver in self.drivers]
         r = {}
         for gid, (drv_idx, lid) in self._gid_to_port.items():
-            st = self.drivers[drv_idx].get_local_state(lid)
+            st = snapshots[drv_idx].get(lid, MotorState(999,0,0,0,0))
             r[gid] = st
         return r
 

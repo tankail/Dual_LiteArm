@@ -46,6 +46,7 @@ DEFAULT_TORQUE_LIMIT = np.array([15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0])
 DEFAULT_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.05
 DEFAULT_FEEDBACK_JUMP_TOLERANCE_RAD = 0.35
 DEFAULT_FEEDBACK_JUMP_VELOCITY_SCALE = 4.0
+DEFAULT_FEEDBACK_MAX_BAD_SAMPLES = 5
 
 
 def _as_float_array(values: Iterable[float], size: int, name: str) -> np.ndarray:
@@ -316,15 +317,32 @@ class DualLiteArmPython:
                 DEFAULT_FEEDBACK_JUMP_VELOCITY_SCALE,
             )
         )
+        self.state_wait_after_request = float(
+            control_cfg.get("state_wait_after_request", 0.001)
+        )
+        self.feedback_max_bad_samples = int(
+            control_cfg.get(
+                "feedback_max_bad_samples",
+                DEFAULT_FEEDBACK_MAX_BAD_SAMPLES,
+            )
+        )
         if self.feedback_limit_tolerance_rad < 0.0:
             raise ValueError("feedback_limit_tolerance_rad must be non-negative")
         if self.feedback_jump_tolerance_rad <= 0.0:
             raise ValueError("feedback_jump_tolerance_rad must be positive")
         if self.feedback_jump_velocity_scale < 0.0:
             raise ValueError("feedback_jump_velocity_scale must be non-negative")
+        if self.state_wait_after_request < 0.0:
+            raise ValueError("state_wait_after_request must be non-negative")
+        if self.feedback_max_bad_samples < 1:
+            raise ValueError("feedback_max_bad_samples must be at least 1")
         self._feedback_prev_q: Optional[Dict[str, np.ndarray]] = None
+        self._feedback_prev_dq: Optional[Dict[str, np.ndarray]] = None
         self._feedback_prev_time: Optional[float] = None
         self._feedback_fault: Optional[str] = None
+        self._feedback_bad_counts = {
+            side: np.zeros(7, dtype=np.int64) for side in ("left", "right")
+        }
         self.motor_count = max(
             gid
             for group in self.config.get("groups", {}).values()
@@ -362,8 +380,12 @@ class DualLiteArmPython:
         port_motor_types = build_port_motor_types(cfg)
         self.manager = MultiMotorManager(cfg["ports"], port_motor_types)
         self._feedback_prev_q = None
+        self._feedback_prev_dq = None
         self._feedback_prev_time = None
         self._feedback_fault = None
+        self._feedback_bad_counts = {
+            side: np.zeros(7, dtype=np.int64) for side in ("left", "right")
+        }
         print(f"Opening {len(cfg['ports'])} serial ports for {self.motor_count} motors")
         self.manager.open_all()
         self.manager.init_all()
@@ -382,9 +404,13 @@ class DualLiteArmPython:
         finally:
             self.manager = None
 
-    def read_state(self, wait_after_request: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+    def read_state(
+        self, wait_after_request: Optional[float] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
         if self.manager is None:
             raise RuntimeError("controller is not open")
+        if wait_after_request is None:
+            wait_after_request = self.state_wait_after_request
         self.manager.request_all_states()
         if wait_after_request > 0.0:
             time.sleep(wait_after_request)
@@ -433,7 +459,11 @@ class DualLiteArmPython:
             raise RuntimeError(self._feedback_fault)
 
         now = time.monotonic()
-        current_q = {}
+        jump_details: Dict[Tuple[str, int], Tuple[float, float, float, float]] = {}
+        dt = None
+        if self._feedback_prev_q is not None and self._feedback_prev_time is not None:
+            dt = max(now - self._feedback_prev_time, 1.0e-3)
+
         for side in ("left", "right"):
             q = self.arm_q(side)
             dq = self.arm_dq(side)
@@ -443,41 +473,96 @@ class DualLiteArmPython:
             lower, upper = self.joint_limits[side]
             safe_lower = lower - self.feedback_limit_tolerance_rad
             safe_upper = upper + self.feedback_limit_tolerance_rad
-            outside = np.flatnonzero((q < safe_lower) | (q > safe_upper))
-            if outside.size:
-                joint = int(outside[0])
-                gid = self.arm_ids(side)[joint]
-                raise RuntimeError(
-                    f"{side} j{joint + 1} feedback out of limits: "
-                    f"q={q[joint]:.4f} rad, allowed=[{safe_lower[joint]:.4f}, "
-                    f"{safe_upper[joint]:.4f}] rad, global_id={gid}"
-                )
-            current_q[side] = q
 
-        if self._feedback_prev_q is not None and self._feedback_prev_time is not None:
-            dt = max(now - self._feedback_prev_time, 1.0e-3)
-            for side in ("left", "right"):
-                q = current_q[side]
-                dq = self.arm_dq(side)
+            outside = (q < safe_lower) | (q > safe_upper)
+            abnormal = np.zeros(7, dtype=bool)
+            if dt is not None:
                 delta = np.abs(q - self._feedback_prev_q[side])
                 allowed = (
                     self.feedback_jump_tolerance_rad
                     + self.feedback_jump_velocity_scale * np.abs(dq) * dt
                 )
-                abnormal = np.flatnonzero(delta > allowed)
-                if abnormal.size:
-                    joint = int(abnormal[0])
-                    gid = self.arm_ids(side)[joint]
+                abnormal = delta > allowed
+                for joint in np.flatnonzero(abnormal):
+                    joint_index = int(joint)
+                    estimated_dq = (
+                        (q[joint_index] - self._feedback_prev_q[side][joint_index])
+                        / dt
+                    )
+                    jump_details[(side, joint_index)] = (
+                        float(delta[joint_index]),
+                        float(dq[joint_index]),
+                        float(allowed[joint_index]),
+                        float(estimated_dq),
+                    )
+
+            bad = outside | abnormal
+            self._feedback_bad_counts[side][~bad] = 0
+
+            for joint in np.flatnonzero(bad):
+                joint_index = int(joint)
+                count = int(self._feedback_bad_counts[side][joint_index]) + 1
+                self._feedback_bad_counts[side][joint_index] = count
+                gid = self.arm_ids(side)[joint_index]
+
+                if self._feedback_prev_q is None or self._feedback_prev_dq is None:
                     raise RuntimeError(
-                        f"{side} j{joint + 1} feedback jump: "
-                        f"previous={self._feedback_prev_q[side][joint]:.4f} rad, "
-                        f"current={q[joint]:.4f} rad, delta={delta[joint]:.4f} rad, "
-                        f"dq={dq[joint]:.4f} rad/s, dt={dt:.4f} s, "
+                        f"{side} j{joint_index + 1} invalid initial feedback: "
+                        f"q={q[joint_index]:.4f} rad, global_id={gid}"
+                    )
+
+                if count >= self.feedback_max_bad_samples:
+                    if outside[joint_index]:
+                        raise RuntimeError(
+                            f"{side} j{joint_index + 1} feedback out of limits "
+                            f"for {count} consecutive samples: "
+                            f"q={q[joint_index]:.4f} rad, allowed=["
+                            f"{safe_lower[joint_index]:.4f}, "
+                            f"{safe_upper[joint_index]:.4f}] rad, "
+                            f"global_id={gid}"
+                        )
+
+                    (
+                        delta_value,
+                        dq_value,
+                        allowed_value,
+                        estimated_dq_value,
+                    ) = jump_details[
+                        (side, joint_index)
+                    ]
+                    raise RuntimeError(
+                        f"{side} j{joint_index + 1} feedback jump persisted for "
+                        f"{count} consecutive samples: "
+                        f"previous={self._feedback_prev_q[side][joint_index]:.4f} rad, "
+                        f"current={q[joint_index]:.4f} rad, "
+                        f"delta={delta_value:.4f} rad, "
+                        f"allowed={allowed_value:.4f} rad, "
+                        f"dq_reported={dq_value:.4f} rad/s, "
+                        f"dq_from_position={estimated_dq_value:.4f} rad/s, "
+                        f"dt={dt:.4f} s, "
                         f"global_id={gid}"
                     )
 
+                # A single bad encoder/CAN sample must not become the next
+                # control state. Keep the last accepted position and velocity.
+                self.positions[gid - 1] = self._feedback_prev_q[side][joint_index]
+                self.velocities[gid - 1] = self._feedback_prev_dq[side][joint_index]
+                if count == 1:
+                    reason = "limit" if outside[joint_index] else "jump"
+                    print(
+                        f"[Feedback] holding {side} j{joint_index + 1} "
+                        f"previous sample ({reason}, "
+                        f"{count}/{self.feedback_max_bad_samples}, "
+                        f"global_id={gid})"
+                    )
+
+        # Store the state after transient samples have been replaced. Bad
+        # samples therefore cannot poison the baseline for the next cycle.
         self._feedback_prev_q = {
-            side: values.copy() for side, values in current_q.items()
+            side: self.arm_q(side).copy() for side in ("left", "right")
+        }
+        self._feedback_prev_dq = {
+            side: self.arm_dq(side).copy() for side in ("left", "right")
         }
         self._feedback_prev_time = now
 
@@ -544,5 +629,7 @@ class DualLiteArmPython:
         print(
             "feedback safety: joint limits + jump detection "
             f"(limit_tol={self.feedback_limit_tolerance_rad:.3f} rad, "
-            f"jump_base={self.feedback_jump_tolerance_rad:.3f} rad)"
+            f"jump_base={self.feedback_jump_tolerance_rad:.3f} rad, "
+            f"hold={self.feedback_max_bad_samples - 1} bad samples, "
+            f"state_wait={self.state_wait_after_request * 1000.0:.1f} ms)"
         )
