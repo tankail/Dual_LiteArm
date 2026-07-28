@@ -13,12 +13,20 @@ from litearm_control import DEFAULT_CONFIG, DualLiteArmPython, format_vector
 
 
 keep_running = True
+handoff_requested = False
 
 
 def _signal_handler(_signum, _frame):
     global keep_running
     keep_running = False
     print("\nInterrupted; stopping gravity compensation.")
+
+
+def _handoff_handler(_signum, _frame):
+    global handoff_requested, keep_running
+    handoff_requested = True
+    keep_running = False
+    print("\nGravity -> impedance handoff requested; preserving last MIT command.")
 
 
 def parse_args():
@@ -31,10 +39,11 @@ def parse_args():
 
 
 def main():
-    global keep_running
+    global keep_running, handoff_requested
     args = parse_args()
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGUSR1, _handoff_handler)
 
     robot = DualLiteArmPython(args.config)
     robot.open()
@@ -75,7 +84,9 @@ def main():
                 next_tick = time.monotonic()
             loop_count += 1
     finally:
-        robot.close(stop=not args.dry_run)
+        # During a Gravity -> Impedance handoff, do not send STOP. The
+        # impedance process will take over the serial ports immediately.
+        robot.close(stop=not args.dry_run and not handoff_requested)
         print("Gravity compensation stopped.")
 
 

@@ -87,7 +87,7 @@ def main():
             "torque limit: "
             f"{format_vector(robot.dynamics['left'].torque_limit)}"
         )
-        print("feedback guard: disabled")
+        print("feedback: direct q/dq, no jump filtering or hold-last-sample")
         print(f"mode: {'DRY-RUN' if args.dry_run else 'MIT torque output'}")
         print(f"[left] q_target(rad):  {format_vector(targets['left'])}")
         print(f"[right] q_target(rad): {format_vector(targets['right'])}")
