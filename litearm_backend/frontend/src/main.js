@@ -152,10 +152,14 @@ class DigitalTwinApp {
             this.connectionUI.createUI();
             this.connectionUI.onModeChanged = (mode) => {
                 this.jointControlsUI.setControlMode(mode);
+                if (this.keyboardControlUI) this.keyboardControlUI.setMode(mode);
             };
 
             // Initialize keyboard control UI
-            this.keyboardControlUI = new KeyboardControlUI(this.robotConnection);
+            this.keyboardControlUI = new KeyboardControlUI(
+                this.robotConnection,
+                this.panelManager
+            );
             this.keyboardControlUI.init();
 
             // Initialize script control UI (SDK example runner)
@@ -224,6 +228,11 @@ class DigitalTwinApp {
             // Enable connected mode in joint controls
             this.jointControlsUI.setConnectedMode(true);
             this.jointControlsUI.setControlMode(config.control_mode || this.robotConnection.getMode());
+            if (this.keyboardControlUI) {
+                this.keyboardControlUI.setMode(
+                    config.control_mode || this.robotConnection.getMode()
+                );
+            }
 
             // Enable keyboard control
             if (this.keyboardControlUI) this.keyboardControlUI.setEnabled(true);
@@ -248,6 +257,7 @@ class DigitalTwinApp {
             // Disable connected mode
             this.jointControlsUI.setConnectedMode(false);
             this.jointControlsUI.setControlMode('position');
+            if (this.keyboardControlUI) this.keyboardControlUI.setMode('position');
 
             // Disable keyboard control
             if (this.keyboardControlUI) this.keyboardControlUI.setEnabled(false);

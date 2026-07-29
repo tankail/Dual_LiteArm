@@ -1,153 +1,228 @@
 /**
- * KeyboardControlUI - Browser keyboard control for cartesian impedance
+ * KeyboardControlUI - WebSocket keyboard control for one selected arm.
  *
- * Captures keydown/keyup on the document and forwards them to the backend
- * via WebSocket. The backend processes key states at 250Hz, identical to pygame.
- *
- * Continuous keys: W/S, A/D, Q/E, I/K, J/L, U/O, Z/X
- * One-shot commands: R (home), M (zero FT), Space (print pose)
+ * The backend owns the control loop. These buttons only select the
+ * left_keyboard/right_keyboard control mode and forward key events.
  */
 
-// Continuous keys that send key_down/key_up
-const CONTINUOUS_KEYS = new Set([
+const KEYBOARD_BUTTONS = {
+    left: 'toggle-left-keyboard',
+    right: 'toggle-right-keyboard'
+};
+
+const KEYBOARD_MODES = {
+    left: 'left_keyboard',
+    right: 'right_keyboard'
+};
+
+const KEYBOARD_LABELS = {
+    left: 'Left Keyboard',
+    right: 'Right Keyboard'
+};
+
+const MOTION_KEYS = new Set([
     'w', 's', 'a', 'd', 'q', 'e',
     'i', 'k', 'j', 'l', 'u', 'o',
     'z', 'x'
 ]);
 
-// One-shot command mapping
-const COMMAND_KEYS = {
-    'r': 'home',
-    'm': 'zero_ft',
-    ' ': 'print_pose'
-};
+const KEYBOARD_PANEL_ID = 'floating-keyboard-panel';
 
 export class KeyboardControlUI {
-    constructor(robotConnection) {
+    constructor(robotConnection, panelManager = null) {
         this.robotConnection = robotConnection;
+        this.panelManager = panelManager;
         this.enabled = false;
-        this.activeKeys = new Set();
-
-        // Bound handlers (for removal)
-        this._onKeyDown = this._handleKeyDown.bind(this);
-        this._onKeyUp = this._handleKeyUp.bind(this);
-        this._onBlur = this._handleBlur.bind(this);
+        this.currentMode = 'position';
+        this.buttons = {};
+        this.panel = null;
+        this.pressedKeys = new Set();
+        this.repeatTimers = new Map();
+        this.documentHandlersBound = false;
     }
 
     init() {
-        document.addEventListener('keydown', this._onKeyDown);
-        document.addEventListener('keyup', this._onKeyUp);
-        window.addEventListener('blur', this._onBlur);
-
-        this.setupHelpPanel();
+        this.panel = document.getElementById(KEYBOARD_PANEL_ID);
+        this.bindButtons();
+        this.bindPanelClose();
+        this.bindKeyboardEvents();
         this.updateStatusDisplay();
+        this.updateButtonState();
     }
 
     setEnabled(enabled) {
-        this.enabled = enabled;
-        if (!enabled) {
-            this._releaseAllKeys();
-        }
+        this.enabled = Boolean(enabled);
+        if (!this.enabled) this.releasePressedKeys();
         this.updateStatusDisplay();
+        this.updateButtonState();
     }
 
-    _handleKeyDown(event) {
-        // Ignore when typing in input fields
-        const tag = event.target.tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-        if (!this.enabled) return;
-
-        const key = event.key.toLowerCase();
-
-        // Continuous keys
-        if (CONTINUOUS_KEYS.has(key)) {
-            event.preventDefault();
-            if (!this.activeKeys.has(key)) {
-                this.activeKeys.add(key);
-                this.robotConnection.sendKeyDown(key);
-                this.updateActiveKeyDisplay();
-            }
-            return;
-        }
-
-        // One-shot commands (only on first press, not repeat)
-        if (!event.repeat && key in COMMAND_KEYS) {
-            event.preventDefault();
-            this.robotConnection.sendCommand(COMMAND_KEYS[key]);
-            this.flashCommandKey(key);
-        }
+    setMode(mode) {
+        this.currentMode = mode || 'position';
+        if (!this.isKeyboardMode()) this.releasePressedKeys();
+        this.updateStatusDisplay();
+        this.updateButtonState();
     }
 
-    _handleKeyUp(event) {
-        const key = event.key.toLowerCase();
+    bindButtons() {
+        Object.entries(KEYBOARD_BUTTONS).forEach(([side, buttonId]) => {
+            const button = document.getElementById(buttonId);
+            if (!button) return;
 
-        if (CONTINUOUS_KEYS.has(key) && this.activeKeys.has(key)) {
-            this.activeKeys.delete(key);
-            this.robotConnection.sendKeyUp(key);
-            this.updateActiveKeyDisplay();
-        }
-    }
-
-    _handleBlur() {
-        // Window lost focus - release everything to stop robot motion
-        this._releaseAllKeys();
-    }
-
-    _releaseAllKeys() {
-        for (const key of this.activeKeys) {
-            this.robotConnection.sendKeyUp(key);
-        }
-        this.activeKeys.clear();
-        this.updateActiveKeyDisplay();
-    }
-
-    // ========== UI ==========
-
-    setupHelpPanel() {
-        const toggleBtn = document.getElementById('toggle-keyboard-panel');
-        const panel = document.getElementById('floating-keyboard-panel');
-        if (!toggleBtn || !panel) return;
-
-        toggleBtn.addEventListener('click', () => {
-            const isVisible = panel.style.display !== 'none';
-            panel.style.display = isVisible ? 'none' : 'block';
-            toggleBtn.classList.toggle('active', !isVisible);
-        });
-
-        const closeBtn = panel.querySelector('.panel-close-btn');
-        if (closeBtn) {
-            closeBtn.addEventListener('click', () => {
-                panel.style.display = 'none';
-                toggleBtn.classList.remove('active');
+            this.buttons[side] = button;
+            button.dataset.arm = side;
+            button.addEventListener('click', () => {
+                if (!this.enabled || !this.robotConnection.isConnected()) return;
+                this.showPanel(button);
+                this.robotConnection.setMode(KEYBOARD_MODES[side]);
+                this.setMode(KEYBOARD_MODES[side]);
             });
-        }
-    }
-
-    updateActiveKeyDisplay() {
-        const keyElements = document.querySelectorAll('.kb-key[data-key]');
-        keyElements.forEach(el => {
-            const key = el.getAttribute('data-key');
-            el.classList.toggle('active', this.activeKeys.has(key));
         });
     }
 
-    flashCommandKey(key) {
-        const el = document.querySelector(`.kb-key[data-key="${key}"]`);
-        if (!el) return;
+    bindPanelClose() {
+        const closeButton = this.panel?.querySelector('.panel-close-btn');
+        closeButton?.addEventListener('click', () => this.hidePanel());
+    }
 
-        el.classList.add('flash');
-        setTimeout(() => el.classList.remove('flash'), 200);
+    bindKeyboardEvents() {
+        if (this.documentHandlersBound) return;
+        this.documentHandlersBound = true;
+
+        document.addEventListener('keydown', (event) => {
+            if (!this.enabled || !this.isKeyboardMode()) return;
+            if (event.target instanceof HTMLInputElement ||
+                event.target instanceof HTMLTextAreaElement ||
+                event.target instanceof HTMLSelectElement ||
+                event.target.isContentEditable) {
+                return;
+            }
+
+            const key = event.key.toLowerCase();
+            if (key === 'r') {
+                if (!this.pressedKeys.has(key)) {
+                    event.preventDefault();
+                    this.pressedKeys.add(key);
+                    this.robotConnection.sendCommand('home');
+                }
+                return;
+            }
+
+            if (!MOTION_KEYS.has(key)) return;
+            event.preventDefault();
+            if (this.pressedKeys.has(key)) return;
+            this.pressedKeys.add(key);
+            this.robotConnection.sendKeyDown(key);
+            this.startKeyRepeat(key);
+        });
+
+        document.addEventListener('keyup', (event) => {
+            const key = event.key.toLowerCase();
+            if (!this.pressedKeys.has(key)) return;
+            event.preventDefault();
+            this.pressedKeys.delete(key);
+            this.stopKeyRepeat(key);
+            if (key !== 'r') this.robotConnection.sendKeyUp(key);
+        });
+
+        window.addEventListener('blur', () => this.releasePressedKeys());
+    }
+
+    releasePressedKeys() {
+        this.pressedKeys.forEach((key) => {
+            this.stopKeyRepeat(key);
+            if (key !== 'r') this.robotConnection.sendKeyUp(key);
+        });
+        this.pressedKeys.clear();
+    }
+
+    startKeyRepeat(key) {
+        this.stopKeyRepeat(key);
+        const timer = window.setInterval(() => {
+            if (!this.enabled || !this.isKeyboardMode() ||
+                !this.pressedKeys.has(key)) {
+                this.stopKeyRepeat(key);
+                return;
+            }
+            this.robotConnection.sendKeyDown(key);
+        }, 80);
+        this.repeatTimers.set(key, timer);
+    }
+
+    stopKeyRepeat(key) {
+        const timer = this.repeatTimers.get(key);
+        if (timer !== undefined) {
+            window.clearInterval(timer);
+            this.repeatTimers.delete(key);
+        }
+    }
+
+    isKeyboardMode() {
+        return this.currentMode === KEYBOARD_MODES.left ||
+            this.currentMode === KEYBOARD_MODES.right;
+    }
+
+    getActiveSide() {
+        return Object.entries(KEYBOARD_MODES)
+            .find(([, mode]) => mode === this.currentMode)?.[0] || null;
+    }
+
+    showPanel(anchorButton = null) {
+        if (!this.panel) return;
+
+        if (this.panelManager) {
+            this.panelManager.showPanel(KEYBOARD_PANEL_ID, 'flex', {
+                anchorEl: anchorButton,
+                align: 'right',
+                offsetX: 40
+            });
+        } else {
+            this.panel.style.display = 'flex';
+        }
+    }
+
+    hidePanel() {
+        if (!this.panel) return;
+
+        if (this.panelManager) {
+            this.panelManager.hidePanel(KEYBOARD_PANEL_ID);
+        } else {
+            this.panel.style.display = 'none';
+        }
+    }
+
+    updateButtonState() {
+        const activeSide = this.getActiveSide();
+        Object.entries(this.buttons).forEach(([side, button]) => {
+            const isActive = side === activeSide;
+            button.disabled = !this.enabled;
+            button.classList.toggle('active', isActive);
+            button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+            button.title = this.enabled
+                ? `Select ${KEYBOARD_LABELS[side]}`
+                : 'Connect to the robot first';
+        });
     }
 
     updateStatusDisplay() {
-        const statusDot = document.querySelector('.kb-status-dot');
-        const statusText = document.querySelector('.kb-status-text');
+        const statusDot = this.panel?.querySelector('.kb-status-dot');
+        const statusText = this.panel?.querySelector('.kb-status-text');
+        const activeSide = this.getActiveSide();
 
         if (statusDot) {
-            statusDot.className = `kb-status-dot ${this.enabled ? 'active' : 'inactive'}`;
+            statusDot.className = `kb-status-dot ${
+                !this.enabled ? 'inactive' :
+                    activeSide ? 'active' : 'ready'
+            }`;
         }
-        if (statusText) {
-            statusText.textContent = this.enabled ? 'Keyboard active' : 'Not connected';
+
+        if (!statusText) return;
+        if (!this.enabled) {
+            statusText.textContent = 'Not connected';
+        } else if (activeSide) {
+            statusText.textContent = `${KEYBOARD_LABELS[activeSide]} active`;
+        } else {
+            statusText.textContent = 'Select an arm keyboard mode';
         }
     }
 }

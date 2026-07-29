@@ -276,12 +276,18 @@ export class RobotConnection {
 
     /**
      * Set control mode
-     * @param {string} mode - 'position', 'gravity_comp', or 'impedance'
+     * @param {string} mode - position, gravity_comp, impedance, left_keyboard, or right_keyboard
      */
     setMode(mode) {
         if (!this.connected || !this.socket) return
 
-        if (!['position', 'gravity_comp', 'impedance'].includes(mode)) {
+        if (![
+            'position',
+            'gravity_comp',
+            'impedance',
+            'left_keyboard',
+            'right_keyboard'
+        ].includes(mode)) {
             console.error('[RobotConnection] Invalid mode:', mode)
             return
         }
@@ -318,7 +324,7 @@ export class RobotConnection {
 
     /**
      * Send one-shot command
-     * @param {string} action - 'home', 'zero_ft', or 'print_pose'
+     * @param {string} action - one-shot command such as 'home'
      */
     sendCommand(action) {
         if (!this.connected || !this.socket) return

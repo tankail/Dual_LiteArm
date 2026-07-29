@@ -30,6 +30,10 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 TEACH_DIR = os.path.normpath(os.path.join(BACKEND_DIR, '..', 'src', 'litearm_robot', 'teach'))
 if TEACH_DIR not in sys.path:
     sys.path.insert(0, TEACH_DIR)
+DEMO_SCRIPT_DIR = os.path.normpath(os.path.join(
+    BACKEND_DIR, '..', 'src', 'litearm_robot', 'scripts'))
+if DEMO_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, DEMO_SCRIPT_DIR)
 
 from motor_driver import MultiMotorManager, MotorState, rad_to_deg, deg_to_rad
 
@@ -41,6 +45,24 @@ try:
 except ImportError:
     HAS_PINOCCHIO = False
     print("[WARN] Pinocchio not available — FK disabled")
+
+try:
+    from litearm_demo_common import (
+        damped_pseudoinverse,
+        forward_kinematics,
+        jacobian,
+    )
+    HAS_KEYBOARD_KINEMATICS = HAS_PINOCCHIO
+    KEYBOARD_KINEMATICS_ERROR = (
+        "" if HAS_KEYBOARD_KINEMATICS
+        else "Pinocchio is not available"
+    )
+except Exception as exc:
+    HAS_KEYBOARD_KINEMATICS = False
+    KEYBOARD_KINEMATICS_ERROR = str(exc)
+    forward_kinematics = None
+    jacobian = None
+    damped_pseudoinverse = None
 
 # ── Flask / SocketIO ───────────────────────────────────────────
 from flask import Flask, jsonify, send_from_directory, request as flask_request
@@ -59,7 +81,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 robot = None          # MultiMotorManager or DemoRobot
 config = {}
 targets = {}          # {global_id: target_position}
-control_mode = "position"  # position | free | gravity_comp | impedance | script
+control_mode = "position"  # position | free | gravity_comp | impedance | left_keyboard | right_keyboard | script
 demo_mode = False
 running = False
 state_lock = threading.Lock()
@@ -74,6 +96,17 @@ impedance_torque_limits = np.array([], dtype=np.float64)
 arm_dynamics = {}
 arm_joint_ids = {}
 dynamics_error = ""
+KEYBOARD_MODES = {
+    'left_keyboard': 'left',
+    'right_keyboard': 'right',
+}
+KEYBOARD_POSITION_STEP = 0.005
+KEYBOARD_ROTATION_STEP = 0.03
+KEYBOARD_JACOBIAN_DAMPING = 0.04
+KEYBOARD_MAX_JOINT_STEP = 0.08
+keyboard_lock = threading.RLock()
+keyboard_active_keys = {'left': set(), 'right': set()}
+keyboard_cartesian_targets = {'left': None, 'right': None}
 script_process = None
 script_name = None
 script_output_lines = []
@@ -589,6 +622,259 @@ def _set_impedance_targets_from_positions():
         impedance_targets[:] = current
 
 
+def _keyboard_side_for_mode(mode):
+    return KEYBOARD_MODES.get(mode)
+
+
+def _keyboard_gripper_gid(side):
+    group = config.get('groups', {}).get(side, {})
+    motor_indices = list(group.get('motor_indices', []))
+    gripper_index = int(group.get('gripper_index', len(motor_indices) - 1))
+    if gripper_index < 0 or gripper_index >= len(motor_indices):
+        raise RuntimeError(f'invalid {side} gripper index: {gripper_index}')
+    return int(motor_indices[gripper_index])
+
+
+def _initialize_keyboard_target(side, q_arm=None):
+    """Latch a Cartesian target from the selected arm joint target."""
+    if not HAS_KEYBOARD_KINEMATICS:
+        raise RuntimeError(
+            KEYBOARD_KINEMATICS_ERROR or
+            'keyboard Cartesian kinematics are unavailable')
+    if q_arm is None:
+        q_arm = _arm_impedance_target(side)
+    position, rotation = forward_kinematics(config, side, q_arm)
+    with keyboard_lock:
+        keyboard_cartesian_targets[side] = {
+            'position': np.asarray(position, dtype=np.float64).copy(),
+            'rotation': np.asarray(rotation, dtype=np.float64).copy(),
+        }
+
+
+def _set_keyboard_joint_target(side, q_arm):
+    """Write seven arm joints into the shared impedance target array."""
+    ids = arm_joint_ids.get(side)
+    if not ids:
+        ids = _arm_joint_ids_from_config(side)
+    indices = np.asarray(ids, dtype=np.int64) - 1
+    values = np.asarray(q_arm, dtype=np.float64)[:7]
+    if len(values) != 7:
+        raise ValueError(f'{side} keyboard target must contain 7 joints')
+    with impedance_lock:
+        impedance_targets[indices] = values
+
+
+def _set_keyboard_gripper_target(side, target):
+    """Set the selected arm gripper target using the configured limits."""
+    group = config.get('groups', {}).get(side, {})
+    limits = group.get('joint_limits', {})
+    gripper_index = int(group.get(
+        'gripper_index',
+        len(group.get('motor_indices', [])) - 1))
+    lower = list(limits.get('lower', []))
+    upper = list(limits.get('upper', []))
+    lo = float(lower[gripper_index]) if gripper_index < len(lower) else 0.0
+    hi = float(upper[gripper_index]) if gripper_index < len(upper) else 1.8
+    gid = _keyboard_gripper_gid(side)
+    value = max(lo, min(hi, float(target)))
+    with impedance_lock:
+        impedance_targets[gid - 1] = value
+
+
+def _keyboard_home(side):
+    """Move only the selected arm to the configured zero/Home joint pose."""
+    q_home = np.zeros(7, dtype=np.float64)
+    _set_keyboard_joint_target(side, q_home)
+    _set_keyboard_gripper_target(side, 0.0)
+    _initialize_keyboard_target(side, q_home)
+
+
+def _keyboard_joint_limits(side):
+    """Return the seven configured arm-joint limits."""
+    limits = config.get('groups', {}).get(side, {}).get('joint_limits', {})
+    lower = np.asarray(limits.get('lower', [-np.inf] * 7), dtype=np.float64)[:7]
+    upper = np.asarray(limits.get('upper', [np.inf] * 7), dtype=np.float64)[:7]
+    if lower.size != 7 or upper.size != 7:
+        raise RuntimeError(f'{side} keyboard joint limits must contain 7 joints')
+    return lower, upper
+
+
+def _keyboard_twist_for_key(key):
+    """Return one Cartesian position/orientation increment for a key."""
+    twist = np.zeros(6, dtype=np.float64)
+    if key == 'w':
+        twist[0] = KEYBOARD_POSITION_STEP
+    elif key == 's':
+        twist[0] = -KEYBOARD_POSITION_STEP
+    elif key == 'a':
+        twist[1] = KEYBOARD_POSITION_STEP
+    elif key == 'd':
+        twist[1] = -KEYBOARD_POSITION_STEP
+    elif key == 'q':
+        twist[2] = KEYBOARD_POSITION_STEP
+    elif key == 'e':
+        twist[2] = -KEYBOARD_POSITION_STEP
+    elif key == 'i':
+        twist[4] = KEYBOARD_ROTATION_STEP
+    elif key == 'k':
+        twist[4] = -KEYBOARD_ROTATION_STEP
+    elif key == 'j':
+        twist[5] = KEYBOARD_ROTATION_STEP
+    elif key == 'l':
+        twist[5] = -KEYBOARD_ROTATION_STEP
+    elif key == 'u':
+        twist[3] = KEYBOARD_ROTATION_STEP
+    elif key == 'o':
+        twist[3] = -KEYBOARD_ROTATION_STEP
+    return twist
+
+
+def _keyboard_apply_key(side, key):
+    """Apply one local Cartesian step using damped differential IK.
+
+    Keyboard input is incremental, so a local Jacobian step is more robust
+    than solving a fresh full-pose nonlinear IK problem for every key event.
+    The impedance target is used as the seed, which keeps successive presses
+    continuous even when the physical arm lags behind the commanded target.
+    """
+    key = str(key or '').lower()
+    if key not in {
+        'w', 's', 'a', 'd', 'q', 'e',
+        'i', 'k', 'j', 'l', 'u', 'o',
+        'z', 'x',
+    }:
+        return
+
+    with mode_transition_lock:
+        if control_mode != f'{side}_keyboard':
+            return
+
+        with keyboard_lock:
+            if key in keyboard_active_keys[side]:
+                return
+            keyboard_active_keys[side].add(key)
+
+        try:
+            if key in ('z', 'x'):
+                # LiteArm's native gripper convention is 0.0 closed and
+                # 0.8 open, matching the C++ gripperOpen/gripperClose APIs.
+                _set_keyboard_gripper_target(side, 0.0 if key == 'z' else 0.8)
+                return
+
+            if (
+                not HAS_KEYBOARD_KINEMATICS or
+                jacobian is None or
+                damped_pseudoinverse is None
+            ):
+                raise RuntimeError(
+                    KEYBOARD_KINEMATICS_ERROR or
+                    'keyboard Cartesian kinematics are unavailable')
+
+            with keyboard_lock:
+                if keyboard_cartesian_targets.get(side) is None:
+                    _initialize_keyboard_target(side)
+                q_reference = _arm_impedance_target(side)
+
+            twist = _keyboard_twist_for_key(key)
+            if not np.any(twist):
+                return
+
+            # Jacobian is expressed in LOCAL_WORLD_ALIGNED, so the
+            # rotational part of the increment is in the world frame too.
+            j = jacobian(config, side, q_reference)
+            q_delta = damped_pseudoinverse(
+                j, KEYBOARD_JACOBIAN_DAMPING
+            ) @ twist
+            q_delta = np.clip(
+                q_delta,
+                -KEYBOARD_MAX_JOINT_STEP,
+                KEYBOARD_MAX_JOINT_STEP,
+            )
+            q_solution = q_reference + q_delta
+            lower, upper = _keyboard_joint_limits(side)
+            q_solution = np.clip(q_solution, lower, upper)
+            if not np.all(np.isfinite(q_solution)):
+                raise RuntimeError(f'{side} keyboard differential IK returned invalid joints')
+
+            # Store the achieved pose instead of the requested pose. This
+            # prevents unreachable directions and joint-limit clipping from
+            # accumulating a Cartesian target that cannot be realized.
+            achieved_position, achieved_rotation = forward_kinematics(
+                config, side, q_solution
+            )
+            _set_keyboard_joint_target(side, q_solution)
+            with keyboard_lock:
+                keyboard_cartesian_targets[side] = {
+                    'position': np.asarray(
+                        achieved_position, dtype=np.float64).copy(),
+                    'rotation': np.asarray(
+                        achieved_rotation, dtype=np.float64).copy(),
+                }
+        except Exception as exc:
+            print(f"[Keyboard] {side} key '{key}' rejected: {exc}")
+            socketio.emit('keyboard_error', {
+                'side': side,
+                'key': key,
+                'message': str(exc),
+            })
+        finally:
+            with keyboard_lock:
+                keyboard_active_keys[side].discard(key)
+
+
+def _send_keyboard_position_target(side):
+    """Continuously send the selected arm's position target.
+
+    This follows the standalone keyboard controller: only the selected arm's
+    motor IDs are included, so the other arm is left untouched.
+    """
+    if robot is None:
+        return
+
+    ids = arm_joint_ids.get(side)
+    if not ids:
+        ids = _arm_joint_ids_from_config(side)
+    gripper_gid = _keyboard_gripper_gid(side)
+    indices = np.asarray(ids, dtype=np.int64) - 1
+
+    with impedance_lock:
+        arm_targets = impedance_targets[indices].copy()
+        arm_limits = impedance_torque_limits[indices].copy()
+        gripper_target = float(impedance_targets[gripper_gid - 1])
+        gripper_limit = float(
+            impedance_torque_limits[gripper_gid - 1] or 2.0)
+
+    control = config.get('control', {})
+    velocity = float(control.get('keyboard_velocity', 0.3))
+    if not math.isfinite(velocity) or velocity <= 0.0:
+        velocity = 0.3
+
+    command = {
+        int(gid): (
+            float(target),
+            velocity,
+            float(limit or 15.0),
+        )
+        for gid, target, limit in zip(ids, arm_targets, arm_limits)
+    }
+    command[gripper_gid] = (
+        gripper_target,
+        velocity,
+        gripper_limit,
+    )
+
+    with serial_io_lock:
+        current_robot = robot
+        if current_robot is None:
+            return
+        try:
+            current_robot.set_all_pos_vel_max_torque(command)
+        except Exception as exc:
+            _drop_backend_robot(
+                f"keyboard position command failed: {exc}",
+                current_robot)
+
+
 def _arm_joint_ids_from_config(side):
     """Return the seven non-gripper global IDs for one arm."""
     group = config.get('groups', {}).get(side, {})
@@ -752,8 +1038,16 @@ def _set_control_mode(mode):
         if mode in ('gravity_comp', 'impedance') and not arm_dynamics:
             raise RuntimeError(
                 dynamics_error or 'internal arm dynamics are unavailable')
+        if mode in KEYBOARD_MODES and not HAS_KEYBOARD_KINEMATICS:
+            raise RuntimeError(
+                KEYBOARD_KINEMATICS_ERROR or
+                'keyboard Cartesian kinematics are unavailable')
 
-        if mode != previous and mode in ('position', 'impedance'):
+        if mode != previous and (
+            mode == 'position' or
+            mode == 'impedance' or
+            mode in KEYBOARD_MODES
+        ):
             try:
                 _refresh_mode_state()
             except Exception as exc:
@@ -761,15 +1055,26 @@ def _set_control_mode(mode):
 
         if mode == 'position' and previous != 'position':
             _hold_current_positions()
-        elif mode == 'impedance' and previous != 'impedance':
+        elif (
+            mode in ('impedance',) or mode in KEYBOARD_MODES
+        ) and previous != mode:
             _set_impedance_targets_from_positions()
+            if mode in KEYBOARD_MODES:
+                _initialize_keyboard_target(KEYBOARD_MODES[mode])
+
+        with keyboard_lock:
+            for active_keys in keyboard_active_keys.values():
+                active_keys.clear()
 
         control_mode = mode
 
 
 def _apply_control_mode(mode):
     """Apply a normal backend mode and send the free-mode command if needed."""
-    if mode not in ('position', 'free', 'gravity_comp', 'impedance'):
+    if mode not in (
+        'position', 'free', 'gravity_comp', 'impedance',
+        'left_keyboard', 'right_keyboard',
+    ):
         raise ValueError(f'Unknown mode: {mode}')
 
     if control_mode == 'script':
@@ -1174,7 +1479,7 @@ def _stop_script(restore_robot=True):
 
 
 def control_loop():
-    """Run position, gravity, or impedance control in one backend loop."""
+    """Run position, gravity, impedance, or keyboard position control."""
     global running, targets, control_mode
     loop_hz = config.get('control', {}).get('loop_hz', 100)
     gravity_loop_hz = config.get('control', {}).get('gravity_loop_hz', 200)
@@ -1197,6 +1502,12 @@ def control_loop():
                     _read_states(wait_after_request=wait)
                     left_torque, right_torque = _compute_internal_torques(mode)
                     _send_internal_torques(left_torque, right_torque)
+
+                elif mode in KEYBOARD_MODES:
+                    wait = float(config.get('control', {}).get(
+                        'state_wait_after_request', 0.0))
+                    _read_states(wait_after_request=wait)
+                    _send_keyboard_position_target(KEYBOARD_MODES[mode])
 
                 elif mode == 'position' and _backend_position_commands_allowed():
                     cmd = {}
@@ -1277,7 +1588,10 @@ def state_broadcast_loop():
                     'torques': torques.tolist(),
                     'target_positions': (
                         impedance_targets.tolist()
-                        if control_mode == 'impedance'
+                        if (
+                            control_mode == 'impedance' or
+                            control_mode in KEYBOARD_MODES
+                        )
                         else [float(targets.get(i+1, 0)) for i in range(MOTOR_COUNT)]
                     ),
                     'impedance_target': impedance_targets.tolist(),
@@ -1516,7 +1830,10 @@ def api_set_mode():
     global control_mode
     data = flask_request.get_json(silent=True) or {}
     mode = data.get('mode', 'position')
-    if mode not in ('position', 'free', 'gravity_comp', 'impedance'):
+    if mode not in (
+        'position', 'free', 'gravity_comp', 'impedance',
+        'left_keyboard', 'right_keyboard',
+    ):
         return jsonify({'error': f'Unknown mode: {mode}'}), 400
     try:
         _apply_control_mode(mode)
@@ -1770,7 +2087,10 @@ def ws_gravity_comp(data=None):
 def ws_set_mode(data):
     global control_mode
     mode = data.get('mode', 'position') if isinstance(data, dict) else 'position'
-    if mode in ('position', 'free', 'gravity_comp', 'impedance'):
+    if mode in (
+        'position', 'free', 'gravity_comp', 'impedance',
+        'left_keyboard', 'right_keyboard',
+    ):
         try:
             _apply_control_mode(mode)
         except Exception as exc:
@@ -1778,6 +2098,47 @@ def ws_set_mode(data):
             socketio.emit('backend_error', {'message': str(exc)})
             return
         socketio.emit('mode_changed', {'mode': mode})
+
+
+@socketio.on('key_down')
+def ws_key_down(data):
+    """Apply one debounced keyboard step for the active keyboard mode."""
+    mode_side = _keyboard_side_for_mode(control_mode)
+    if not mode_side:
+        return
+    key = data.get('key', '') if isinstance(data, dict) else ''
+    _keyboard_apply_key(mode_side, key)
+
+
+@socketio.on('key_up')
+def ws_key_up(data):
+    """Release a keyboard key tracked by the backend."""
+    mode_side = _keyboard_side_for_mode(control_mode)
+    if not mode_side:
+        return
+    key = str(data.get('key', '') if isinstance(data, dict) else '').lower()
+    with keyboard_lock:
+        keyboard_active_keys[mode_side].discard(key)
+
+
+@socketio.on('command')
+def ws_command(data):
+    """Handle one-shot commands owned by the keyboard control mode."""
+    action = str(data.get('action', '') if isinstance(data, dict) else '').lower()
+    mode_side = _keyboard_side_for_mode(control_mode)
+    if action != 'home' or not mode_side:
+        return
+    try:
+        with mode_transition_lock:
+            _keyboard_home(mode_side)
+        print(f"[Keyboard] {mode_side} → Home")
+    except Exception as exc:
+        print(f"[Keyboard] Home rejected: {exc}")
+        socketio.emit('keyboard_error', {
+            'side': mode_side,
+            'key': 'r',
+            'message': str(exc),
+        })
 
 
 @socketio.on('add_waypoint')

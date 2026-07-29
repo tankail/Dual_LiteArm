@@ -184,10 +184,12 @@ export class ConnectionUI {
             <!-- Control Mode -->
             <div class="robot-controls" style="margin-top: 12px;">
                 <div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;">Control Mode</div>
-                <div id="mode-buttons" style="display:flex;gap:4px;">
-                    <button class="mode-btn control-button active" data-mode="position" style="flex:1;padding:6px 8px;font-size:11px;border-radius:6px;">Position</button>
-                    <button class="mode-btn control-button" data-mode="gravity_comp" style="flex:1;padding:6px 8px;font-size:11px;border-radius:6px;">Gravity</button>
-                    <button class="mode-btn control-button" data-mode="impedance" style="flex:1;padding:6px 8px;font-size:11px;border-radius:6px;">Impedance</button>
+                <div id="mode-buttons" style="display:flex;gap:4px;flex-wrap:wrap;">
+                    <button class="mode-btn control-button active" data-mode="position" style="flex:1 1 calc(33.333% - 4px);padding:6px 8px;font-size:11px;border-radius:6px;">Position</button>
+                    <button class="mode-btn control-button" data-mode="gravity_comp" style="flex:1 1 calc(33.333% - 4px);padding:6px 8px;font-size:11px;border-radius:6px;">Gravity</button>
+                    <button class="mode-btn control-button" data-mode="impedance" style="flex:1 1 calc(33.333% - 4px);padding:6px 8px;font-size:11px;border-radius:6px;">Impedance</button>
+                    <button class="mode-btn control-button" data-mode="left_keyboard" style="flex:1 1 calc(50% - 4px);padding:6px 8px;font-size:11px;border-radius:6px;">Left Keyboard</button>
+                    <button class="mode-btn control-button" data-mode="right_keyboard" style="flex:1 1 calc(50% - 4px);padding:6px 8px;font-size:11px;border-radius:6px;">Right Keyboard</button>
                 </div>
             </div>
 
@@ -212,7 +214,7 @@ export class ConnectionUI {
                         <button id="wp-stop" class="control-button danger" style="padding:8px;font-size:12px;" disabled>■ Stop</button>
                     </div>
                 </div>
-                <div class="waypoints-lock-overlay">Disabled in impedance</div>
+                <div class="waypoints-lock-overlay">Disabled in this control mode</div>
             </div>
         `;
 
@@ -254,7 +256,11 @@ export class ConnectionUI {
     }
 
     isWaypointLocked() {
-        return this.currentMode === 'impedance';
+        return [
+            'impedance',
+            'left_keyboard',
+            'right_keyboard'
+        ].includes(this.currentMode);
     }
 
     updateWaypointLockState() {
