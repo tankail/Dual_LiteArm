@@ -84,6 +84,17 @@ SCRIPT_DIR = os.path.abspath(os.environ.get(
     os.path.join(BACKEND_DIR, 'litearm_python')))
 SCRIPT_RUNNER = os.path.join(BACKEND_DIR, 'run_script.py')
 
+# Waypoint/trajectory state.  Waypoints are full motor-position snapshots;
+# the normal position control loop remains the only code that writes motors.
+waypoints = []
+waypoint_lock = threading.RLock()
+trajectory_lock = threading.RLock()
+trajectory_thread = None
+trajectory_stop_event = None
+MAX_WAYPOINTS = 6
+MIN_WAYPOINT_DURATION = 0.05
+MAX_WAYPOINT_DURATION = 60.0
+
 
 def init_arrays(motor_count):
     """Resize global arrays to match config."""
@@ -777,6 +788,161 @@ def _apply_control_mode(mode):
                         current_robot)
     print(f"[Mode] → {mode}")
     return mode
+
+
+def _waypoints_snapshot():
+    """Return a JSON-safe copy of the current waypoint list."""
+    with waypoint_lock:
+        return [
+            {
+                'positions': list(wp['positions']),
+                'duration': float(wp['duration']),
+                'index': int(wp['index']),
+            }
+            for wp in waypoints
+        ]
+
+
+def _emit_waypoints():
+    socketio.emit('waypoints_updated', {'waypoints': _waypoints_snapshot()})
+
+
+def _normalize_waypoint_positions(values):
+    """Validate and clamp one full-size waypoint position array."""
+    if isinstance(values, np.ndarray):
+        values = values.tolist()
+    if not isinstance(values, (list, tuple)):
+        raise ValueError('waypoint positions must be an array')
+    if len(values) != MOTOR_COUNT:
+        raise ValueError(
+            f'waypoint positions must contain {MOTOR_COUNT} values, '
+            f'got {len(values)}')
+
+    joints_by_gid = {
+        joint['global_id']: joint for joint in build_joint_list(config)
+    }
+    normalized = []
+    for gid, value in enumerate(values, start=1):
+        joint = joints_by_gid.get(gid, {'min': -5.0, 'max': 5.0})
+        target = _clamp_joint_target(value, joint)
+        if target is None:
+            raise ValueError(f'waypoint position {gid} is not finite')
+        normalized.append(float(target))
+    return normalized
+
+
+def _normalize_waypoint_duration(value):
+    duration = 1.0 if value is None else _finite_float(value)
+    if duration is None:
+        raise ValueError('waypoint duration must be finite')
+    if duration < MIN_WAYPOINT_DURATION or duration > MAX_WAYPOINT_DURATION:
+        raise ValueError(
+            f'waypoint duration must be between '
+            f'{MIN_WAYPOINT_DURATION:.2f}s and {MAX_WAYPOINT_DURATION:.1f}s')
+    return float(duration)
+
+
+def _trajectory_is_running():
+    with trajectory_lock:
+        return (
+            trajectory_thread is not None
+            and trajectory_thread.is_alive()
+        )
+
+
+def _cancel_trajectory():
+    """Request cancellation without blocking a Socket.IO event handler."""
+    with trajectory_lock:
+        stop_event = trajectory_stop_event
+        if stop_event is not None:
+            stop_event.set()
+
+
+def _ensure_position_mode_for_trajectory():
+    """Waypoints require backend-owned position mode."""
+    if control_mode == 'script' or script_serial_released:
+        raise RuntimeError('trajectory is unavailable while a script is running')
+    if control_mode != 'position':
+        _apply_control_mode('position')
+
+
+def _set_position_targets(values):
+    with target_lock:
+        for gid, value in enumerate(values, start=1):
+            targets[gid] = float(value)
+
+
+def _run_waypoint_motion(path, control_rate, stop_event, motion_name):
+    """Interpolate a waypoint path and feed targets to the position loop."""
+    global trajectory_thread, trajectory_stop_event
+    try:
+        with state_lock:
+            start = positions.copy()
+
+        for waypoint in path:
+            goal = np.asarray(waypoint['positions'], dtype=np.float64)
+            duration = float(waypoint['duration'])
+            steps = max(1, int(math.ceil(duration * control_rate)))
+
+            for step in range(1, steps + 1):
+                if stop_event.is_set():
+                    return
+                if control_mode != 'position':
+                    raise RuntimeError(
+                        f'control mode changed to {control_mode}')
+
+                alpha = step / steps
+                command = start + (goal - start) * alpha
+                _set_position_targets(command)
+
+                if step < steps and stop_event.wait(1.0 / control_rate):
+                    return
+            start = goal
+
+        socketio.emit('trajectory_complete', {'name': motion_name})
+    except Exception as exc:
+        if not stop_event.is_set():
+            print(f"[Trajectory] {motion_name} failed: {exc}")
+            socketio.emit('trajectory_error', {'error': str(exc)})
+    finally:
+        if stop_event.is_set():
+            # Stop at the latest measured pose instead of continuing toward
+            # an old interpolated target after the user presses Stop.
+            _hold_current_positions()
+            socketio.emit('trajectory_stopped', {'name': motion_name})
+        with trajectory_lock:
+            if trajectory_thread is threading.current_thread():
+                trajectory_thread = None
+                trajectory_stop_event = None
+
+
+def _start_waypoint_motion(path, control_rate, motion_name):
+    """Start one non-blocking waypoint motion, rejecting duplicate runs."""
+    global trajectory_thread, trajectory_stop_event
+    if not path:
+        raise ValueError('waypoint path is empty')
+    if control_rate <= 0.0 or not math.isfinite(control_rate):
+        raise ValueError('control_rate must be positive and finite')
+
+    with trajectory_lock:
+        if trajectory_thread is not None and trajectory_thread.is_alive():
+            raise RuntimeError('another trajectory is already running')
+
+    _ensure_position_mode_for_trajectory()
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_run_waypoint_motion,
+        args=(path, float(control_rate), stop_event, motion_name),
+        daemon=True,
+        name=f'litearm-{motion_name}',
+    )
+    with trajectory_lock:
+        if trajectory_thread is not None and trajectory_thread.is_alive():
+            raise RuntimeError('another trajectory is already running')
+        trajectory_stop_event = stop_event
+        trajectory_thread = thread
+        thread.start()
 
 
 def _release_robot_for_script():
@@ -1485,6 +1651,7 @@ def on_connect():
             'torque_limit': impedance_torque_limits.tolist(),
         },
     })
+    emit('waypoints_updated', {'waypoints': _waypoints_snapshot()})
 
 
 @socketio.on('disconnect')
@@ -1611,6 +1778,84 @@ def ws_set_mode(data):
             socketio.emit('backend_error', {'message': str(exc)})
             return
         socketio.emit('mode_changed', {'mode': mode})
+
+
+@socketio.on('add_waypoint')
+def ws_add_waypoint(data):
+    try:
+        if _trajectory_is_running():
+            raise RuntimeError('cannot add a waypoint during a trajectory')
+        if not isinstance(data, dict):
+            raise ValueError('waypoint data must be an object')
+        positions_list = _normalize_waypoint_positions(data.get('positions'))
+        duration = _normalize_waypoint_duration(data.get('duration'))
+        with waypoint_lock:
+            if len(waypoints) >= MAX_WAYPOINTS:
+                raise RuntimeError(f'maximum {MAX_WAYPOINTS} waypoints allowed')
+            waypoints.append({
+                'positions': positions_list,
+                'duration': duration,
+                'index': len(waypoints),
+            })
+        _emit_waypoints()
+    except Exception as exc:
+        print(f"[Waypoint] add rejected: {exc}")
+        socketio.emit('trajectory_error', {'error': str(exc)})
+
+
+@socketio.on('clear_waypoints')
+def ws_clear_waypoints(data=None):
+    _cancel_trajectory()
+    with waypoint_lock:
+        waypoints.clear()
+    _emit_waypoints()
+
+
+@socketio.on('go_to_waypoint')
+def ws_go_to_waypoint(data):
+    try:
+        index = int(data.get('index', 0)) if isinstance(data, dict) else 0
+        with waypoint_lock:
+            if index < 0 or index >= len(waypoints):
+                raise ValueError(f'waypoint index out of range: {index}')
+            path = [dict(waypoints[index])]
+            path[0]['positions'] = list(waypoints[index]['positions'])
+        _start_waypoint_motion(path, 100.0, f'waypoint_{index}')
+    except Exception as exc:
+        print(f"[Waypoint] move rejected: {exc}")
+        socketio.emit('trajectory_error', {'error': str(exc)})
+
+
+@socketio.on('run_trajectory')
+def ws_run_trajectory(data=None):
+    try:
+        requested_rate = (
+            data.get('control_rate', 100.0)
+            if isinstance(data, dict) else 100.0
+        )
+        control_rate = _finite_float(requested_rate)
+        if control_rate is None:
+            raise ValueError('control_rate must be finite')
+        control_rate = max(10.0, min(200.0, control_rate))
+        with waypoint_lock:
+            if len(waypoints) < 2:
+                raise ValueError('at least two waypoints are required')
+            path = [
+                {
+                    'positions': list(wp['positions']),
+                    'duration': float(wp['duration']),
+                }
+                for wp in waypoints
+            ]
+        _start_waypoint_motion(path, control_rate, 'trajectory')
+    except Exception as exc:
+        print(f"[Trajectory] start rejected: {exc}")
+        socketio.emit('trajectory_error', {'error': str(exc)})
+
+
+@socketio.on('stop_trajectory')
+def ws_stop_trajectory(data=None):
+    _cancel_trajectory()
 
 
 # ═══════════════════════════════════════════════════════════════

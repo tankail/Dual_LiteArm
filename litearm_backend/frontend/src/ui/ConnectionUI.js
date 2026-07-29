@@ -312,7 +312,9 @@ export class ConnectionUI {
     goToFirstWaypoint() {
         if (this.isWaypointLocked() || !this.robotConnection.isConnected()) return;
         if (this.trajectoryRunning || this.waypoints.length < 1) return;
+        this.trajectoryRunning = true;
         this.robotConnection.socket.emit('go_to_waypoint', { index: 0 });
+        this.updateWaypointButtonState();
     }
 
     /** Run trajectory */
@@ -418,6 +420,7 @@ export class ConnectionUI {
         sock.off('waypoints_updated');
         sock.off('trajectory_complete');
         sock.off('trajectory_error');
+        sock.off('trajectory_stopped');
 
         sock.on('waypoints_updated', (data) => {
             if (data.waypoints) {
@@ -435,6 +438,11 @@ export class ConnectionUI {
             this.trajectoryRunning = false;
             this.updateWaypointButtonState();
             if (data.error) this.showError(data.error);
+        });
+
+        sock.on('trajectory_stopped', () => {
+            this.trajectoryRunning = false;
+            this.updateWaypointButtonState();
         });
     }
 
