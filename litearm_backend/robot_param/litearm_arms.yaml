@@ -21,8 +21,8 @@ groups:
       - "l_gripper_joint"
     motor_indices: [1, 2, 3, 4, 5, 6, 7, 8]
     joint_limits:
-      lower: [-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, 0.0]
-      upper: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 1.8]
+      lower: [-3.0543, -2.8623, -1.5708, -2.4435, -1.5708, -0.76794, -1.5708, 0.0]
+      upper: [1.6581, 0.27925, 1.5708, 1.5708, 1.5708, 0.76794, 1.5708, 1.8]
     gripper_index: 7   # index within this group's joint_names that is the gripper
     end_effector_link: "l_joint7_link"
 
@@ -39,8 +39,8 @@ groups:
       - "r_gripper_joint"
     motor_indices: [9, 10, 11, 12, 13, 14, 15, 16]
     joint_limits:
-      lower: [-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0, 0.0]
-      upper: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 1.8]
+      lower: [-1.6581, -0.27925, -1.5708, -1.5708, -2.5, -0.76794, -1.5708, 0.0]
+      upper: [3.0543, 2.8623, 1.5708, 2.4435, 2.5, 0.76794, 1.5708, 1.8]
     gripper_index: 7
     end_effector_link: "r_joint7_link"
 
@@ -75,7 +75,7 @@ control:
   impedance_loop_hz: 200
   broadcast_hz: 30
   home_timeout: 3.0
-  state_wait_after_request: 0.001
+  state_wait_after_request: 0.002
   feedback_max_bad_samples: 5
 
 # 关节空间阻抗控制：

@@ -32,8 +32,8 @@
     <origin xyz="0 -0.096 0" rpy="0 0 0" />
     <parent link="torso_link" />
     <child link="r_joint1_link" />
-    <axis xyz="0 1 0" />
-    <limit lower="-3.0543" upper="1.6581" effort="75" velocity="6.0737" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.6581" upper="3.0543" effort="75" velocity="6.0737" />
   </joint>
   <link name="r_joint2_link">
     <inertial>
@@ -46,8 +46,8 @@
     <origin xyz="0 -0.059 0" rpy="0 0 0" />
     <parent link="r_joint1_link" />
     <child link="r_joint2_link" />
-    <axis xyz="1 0 0" />
-    <limit lower="-2.8623" upper="0.27925" effort="75" velocity="6.0737" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-0.27925" upper="2.8623" effort="75" velocity="6.0737" />
   </joint>
   <link name="r_joint3_link">
     <inertial>
@@ -74,8 +74,8 @@
     <origin xyz="0 5E-05 -0.1615" rpy="0 0 0" />
     <parent link="r_joint3_link" />
     <child link="r_joint4_link" />
-    <axis xyz="0 1 0" />
-    <limit lower="-2.44" upper="1.57" effort="50" velocity="6.0737" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.5708" upper="2.4435" effort="50" velocity="6.0737" />
   </joint>
   <link name="r_joint5_link">
     <inertial>
@@ -89,7 +89,7 @@
     <parent link="r_joint4_link" />
     <child link="r_joint5_link" />
     <axis xyz="0 0 -1" />
-    <limit lower="-1.5708" upper="1.5708" effort="10" velocity="10.263" />
+    <limit lower="-2.5" upper="2.5" effort="10" velocity="10.263" />
   </joint>
   <link name="r_joint6_link">
     <inertial>
@@ -102,7 +102,7 @@
     <origin xyz="0 0 -0.1255" rpy="0 0 0" />
     <parent link="r_joint5_link" />
     <child link="r_joint6_link" />
-    <axis xyz="1 0 0" />
+    <axis xyz="-1 0 0" />
     <limit lower="-0.76794" upper="0.76794" effort="20" velocity="6.2832" />
   </joint>
   <link name="r_joint7_link">
@@ -116,7 +116,7 @@
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="r_joint6_link" />
     <child link="r_joint7_link" />
-    <axis xyz="0 1 0" />
+    <axis xyz="0 -1 0" />
     <limit lower="-1.5708" upper="1.5708" effort="10" velocity="10.263" />
   </joint>
 </robot>

@@ -415,7 +415,7 @@
      <parent link="r_joint4_link" />
      <child link="r_joint5_link" />
      <axis xyz="0 0 -1" />  <!-- 原来是0 0 -1-->
-     <limit lower="-1.5708" upper="1.5708" effort="10" velocity="10.263" />
+     <limit lower="-2.5" upper="2.5" effort="10" velocity="10.263" />
      <dynamics damping="0.02" friction="0.0"/> <!-- 即使很小的阻尼也能极大改善稳定性 -->
    </joint>
    <link name="r_joint6_link">

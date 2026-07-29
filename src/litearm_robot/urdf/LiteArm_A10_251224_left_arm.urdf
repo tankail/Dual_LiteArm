@@ -75,7 +75,7 @@
     <parent link="l_joint3_link" />
     <child link="l_joint4_link" />
     <axis xyz="0 1 0" />
-    <limit lower="-2.44" upper="1.57" effort="50" velocity="6.0737" />
+    <limit lower="-2.4435" upper="1.5708" effort="50" velocity="6.0737" />
   </joint>
   <link name="l_joint5_link">
     <inertial>

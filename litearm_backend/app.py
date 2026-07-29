@@ -155,6 +155,71 @@ def build_joint_list(cfg):
     return joints
 
 
+def _finite_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _clamp_joint_target(value, joint):
+    number = _finite_float(value)
+    if number is None:
+        return None
+
+    lo = _finite_float(joint.get('min', -5.0))
+    hi = _finite_float(joint.get('max', 5.0))
+    lo = -5.0 if lo is None else lo
+    hi = 5.0 if hi is None else hi
+    if hi < lo:
+        lo, hi = hi, lo
+    return max(lo, min(hi, number))
+
+
+def build_target_updates_from_flat_payload(flat=None, gripper=None):
+    """
+    Convert frontend flat commands into {global_id: target}.
+
+    Current frontend commands should send all 16 joints, including both
+    grippers. Older clients sent only arm joints plus a separate gripper
+    scalar; keep that format working without shifting right-arm IDs.
+    """
+    joints = build_joint_list(config)
+    joints_by_gid = {j['global_id']: j for j in joints}
+    updates = {}
+
+    if flat is not None:
+        if isinstance(flat, np.ndarray):
+            flat = flat.tolist()
+        if isinstance(flat, (list, tuple)):
+            flat_list = list(flat)
+            if len(flat_list) == MOTOR_COUNT:
+                for i, pos in enumerate(flat_list[:MOTOR_COUNT]):
+                    gid = i + 1
+                    joint = joints_by_gid.get(gid, {'min': -5.0, 'max': 5.0})
+                    target = _clamp_joint_target(pos, joint)
+                    if target is not None:
+                        updates[gid] = target
+            else:
+                arm_joints = [j for j in joints if j.get('kind') != 'gripper']
+                for joint, pos in zip(arm_joints, flat_list):
+                    target = _clamp_joint_target(pos, joint)
+                    if target is not None:
+                        updates[joint['global_id']] = target
+
+    gripper_value = _finite_float(gripper)
+    if gripper_value is not None:
+        for joint in joints:
+            if joint.get('kind') != 'gripper':
+                continue
+            target = _clamp_joint_target(gripper_value, joint)
+            if target is not None:
+                updates[joint['global_id']] = target
+
+    return updates
+
+
 def build_port_motor_types(cfg):
     """Normalize YAML motor type lists to {port: {local_id: type}}."""
     result = {}
@@ -1336,11 +1401,13 @@ def state_broadcast_loop():
                     state['ee_position'] = left_fk['position'] if left_fk else [0, 0, 0]
                     state['ee_euler'] = left_fk['euler'] if left_fk else [0, 0, 0]
                     state['gripper_position'] = float(left_all[-1]) if len(left_all) == len(left_ids) else 0.0
+                    state['left_gripper_position'] = state['gripper_position']
                 else:
                     state['forward_kinematics'] = None
                     state['ee_position'] = [0, 0, 0]
                     state['ee_euler'] = [0, 0, 0]
                     state['gripper_position'] = 0.0
+                    state['left_gripper_position'] = 0.0
                 state['external_wrench'] = [0, 0, 0, 0, 0, 0]
 
                 # ── Right arm: FK + group state ──
@@ -1354,6 +1421,7 @@ def state_broadcast_loop():
                     right_fk_pos = right_all[:len(right_arm_joints_fk)]
                     right_fk = fk.compute(right_fk_pos, 'right') if fk else None
                     state['right'] = {'positions': right_all, 'fk': right_fk}
+                    state['right_gripper_position'] = float(right_all[-1]) if len(right_all) == len(right_ids) else 0.0
 
                 # ── Optional groups (waist, head) ──
                 for gname in ['waist', 'head']:
@@ -1447,12 +1515,13 @@ def api_move():
     groups_data = data.get('groups', {})
     if not groups_data:
         # Flat positions array for all motors
-        flat = data.get('positions', [])
-        if len(flat) == MOTOR_COUNT:
+        updates = build_target_updates_from_flat_payload(
+            data.get('positions', None),
+            data.get('gripper', None))
+        if updates:
             with target_lock:
-                for i, pos in enumerate(flat):
-                    targets[i+1] = float(pos)
-        return jsonify({'ok': True})
+                targets.update(updates)
+        return jsonify({'ok': True, 'updated_count': len(updates)})
 
     # Group-based update
     with target_lock:
@@ -1473,9 +1542,13 @@ def api_move():
                     targets[indices[i]] = max(lo, min(hi, float(pos)))
             else:
                 # Single value for gripper
-                lo = limits_lo[0] if limits_lo else 0
-                hi = limits_hi[0] if limits_hi else 5
-                targets[indices[0]] = max(lo, min(hi, float(gvals)))
+                gripper_index = int(ginfo.get(
+                    'gripper_index',
+                    len(indices) - 1 if indices else 0))
+                gripper_index = max(0, min(gripper_index, len(indices) - 1))
+                lo = limits_lo[gripper_index] if gripper_index < len(limits_lo) else 0
+                hi = limits_hi[gripper_index] if gripper_index < len(limits_hi) else 5
+                targets[indices[gripper_index]] = max(lo, min(hi, float(gvals)))
 
     return jsonify({'ok': True, 'targets_count': len(targets)})
 
@@ -1720,11 +1793,14 @@ def ws_move_all(data):
             'message': f'位置目标更新已拒绝: 当前是 {control_mode} 模式'
         })
         return
-    if isinstance(data, dict) and 'positions' in data:
+    if isinstance(data, dict):
+        updates = build_target_updates_from_flat_payload(
+            data.get('positions', None),
+            data.get('gripper', None))
+        if not updates:
+            return
         with target_lock:
-            flat = data['positions']
-            for i, pos in enumerate(flat[:MOTOR_COUNT]):
-                targets[i+1] = float(pos)
+            targets.update(updates)
 
 
 @socketio.on('move_group')

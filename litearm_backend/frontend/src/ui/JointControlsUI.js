@@ -73,7 +73,31 @@ export class JointControlsUI {
     }
 
     isFingerJointName(name) {
-        return name === 'L_finger' || name === 'R_finger';
+        return [
+            'L_finger',
+            'R_finger',
+            'l_r_finger_joint',
+            'l_l_finger_joint',
+            'r_r_finger_joint',
+            'r_l_finger_joint'
+        ].includes(name);
+    }
+
+    getFingerJointNamesForGripper(gripperName) {
+        if (gripperName === 'l_gripper_joint') {
+            return ['l_r_finger_joint', 'l_l_finger_joint', 'L_finger', 'R_finger'];
+        }
+        if (gripperName === 'r_gripper_joint') {
+            return ['r_r_finger_joint', 'r_l_finger_joint', 'L_finger', 'R_finger'];
+        }
+        return [
+            'L_finger',
+            'R_finger',
+            'l_r_finger_joint',
+            'l_l_finger_joint',
+            'r_r_finger_joint',
+            'r_l_finger_joint'
+        ];
     }
 
     createGripperJoint() {
@@ -128,7 +152,7 @@ export class JointControlsUI {
 
         if (this.isGripperName(jointName)) {
             const fingerPos = this.gripperToFingerPosition(value);
-            for (const name of ['L_finger', 'R_finger']) {
+            for (const name of this.getFingerJointNamesForGripper(jointName)) {
                 if (model.getJoint?.(name)) {
                     ModelLoaderFactory.setJointAngle(model, name, fingerPos, true);
                 }
@@ -246,12 +270,13 @@ export class JointControlsUI {
                 const jointIndex = Number(slider.getAttribute('data-joint-index'));
                 let robotPosition;
 
-                if (this.isGripperName(jointName)) {
+                if (jointIndex < positions.length) {
+                    robotPosition = positions[jointIndex];
+                } else if (this.isGripperName(jointName)) {
                     if (state.gripper_position === undefined) return;
                     robotPosition = state.gripper_position;
                 } else {
-                    if (jointIndex >= positions.length) return;
-                    robotPosition = positions[jointIndex];
+                    return;
                 }
 
                 const pendingPosition = this.pendingJointValues.get(jointIndex);
@@ -1122,7 +1147,10 @@ export class JointControlsUI {
             }
         }
 
-        const hasGripperPending = this.pendingJointValues.has(this.jointIndexMap.get('gripper'));
+        const hasGripperPending = Array.from(this.pendingJointValues.keys()).some((jointIndex) => {
+            const jointName = this.getJointNameByIndex(jointIndex);
+            return this.isGripperName(jointName);
+        });
         const canSend = this.isConnectedMode &&
             this.robotConnection &&
             this.robotConnection.isConnected() &&
@@ -1175,25 +1203,32 @@ export class JointControlsUI {
             if (groupPositions.length === 0) return;
             this.robotConnection.moveGroup(selectedGroup, groupPositions, velocity);
         } else {
-            // Send all joints (original behavior)
-            const armPositions = [];
-            let gripperPosition = null;
+            if (!canSendArm) return;
+
+            const robotConfig = this.robotConnection.robotConfig;
+            const state = this.robotConnection.currentState || {};
+            const jointCount = robotConfig?.joints?.length || allSliders.length;
+            const sourcePositions = (
+                Array.isArray(state.target_positions) && state.target_positions.length >= jointCount
+            ) ? state.target_positions : (Array.isArray(state.positions) ? state.positions : []);
+            const commandPositions = Array.from({ length: jointCount }, (_, index) => {
+                const value = Number(sourcePositions[index]);
+                return Number.isFinite(value) ? value : 0.0;
+            });
+
+            let hasCommand = false;
             for (const slider of allSliders) {
-                const jointName = slider.getAttribute('data-joint');
+                const jointIndex = Number(slider.getAttribute('data-joint-index'));
                 const value = parseFloat(slider.value);
+                if (!Number.isInteger(jointIndex) || jointIndex < 0 || jointIndex >= jointCount) continue;
                 if (Number.isNaN(value)) return;
 
-                if (this.isGripperName(jointName)) {
-                    gripperPosition = value;
-                } else {
-                    armPositions.push(value);
-                }
+                commandPositions[jointIndex] = value;
+                hasCommand = true;
             }
 
-            if (!canSendArm && gripperPosition === null) return;
-            if (canSendArm && armPositions.length === 0 && gripperPosition === null) return;
-
-            this.robotConnection.moveAll(canSendArm ? armPositions : null, velocity, gripperPosition);
+            if (!hasCommand) return;
+            this.robotConnection.moveAll(commandPositions, velocity, null);
         }
 
         this.pendingJointValues.clear();

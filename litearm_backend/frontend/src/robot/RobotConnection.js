@@ -171,7 +171,7 @@ export class RobotConnection {
 
     /**
      * Send all joints position command
-     * @param {number[]|null} positions - Array of 6 joint positions in radians, or null for gripper-only commands
+     * @param {number[]|null} positions - Full joint array in backend config order, or null for gripper-only commands
      * @param {number} [velocity] - Movement velocity (optional)
      * @param {number|null} [gripper] - Gripper target position (optional)
      */

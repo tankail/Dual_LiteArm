@@ -2,11 +2,10 @@ robot:
   name: "LiteArm-A10-LeftArm-Follower"
   param_file: "litearm_left_arm_follower_motors.yaml"
 
-# 遥操从臂目标直接映射主臂位置，不做限位夹紧（两臂同构，主臂物理行程即从臂行程）。
-# ±5 仅作为 SDK checkJointLimits 的兜底，防止异常目标值；实际行程由机械限位决定。
+# 遥操从臂目标直接映射主臂位置；限位与 URDF 关节行程保持一致。
 joint_limits:
-  lower: [-5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0]
-  upper: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+  lower: [-3.0543, -2.8623, -1.5708, -2.4435, -1.5708, -0.76794, -1.5708]
+  upper: [1.6581, 0.27925, 1.5708, 1.5708, 1.5708, 0.76794, 1.5708]
 
 urdf:
   file_path: "LiteArm_A10_251125.urdf"
