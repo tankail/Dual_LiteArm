@@ -59,7 +59,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 robot = None          # MultiMotorManager or DemoRobot
 config = {}
 targets = {}          # {global_id: target_position}
-control_mode = "position"  # "position" | "free" | "gravity_comp" | "impedance"
+control_mode = "position"  # position | free | gravity_comp | impedance | script
 demo_mode = False
 running = False
 state_lock = threading.Lock()
@@ -71,6 +71,9 @@ impedance_targets = np.array([], dtype=np.float64)
 impedance_kp = np.array([], dtype=np.float64)
 impedance_kd = np.array([], dtype=np.float64)
 impedance_torque_limits = np.array([], dtype=np.float64)
+arm_dynamics = {}
+arm_joint_ids = {}
+dynamics_error = ""
 script_process = None
 script_name = None
 script_output_lines = []
@@ -103,12 +106,7 @@ torques = np.array([], dtype=np.float64)
 connected = False
 backend_serial_fault = False
 backend_serial_fault_message = ""
-gravity_process = None  # External Python gravity script process
-gravity_serial_released = False
-gravity_transitioning = False
-impedance_process = None  # External Python joint-space impedance process
-impedance_serial_released = False
-impedance_transitioning = False
+script_serial_released = False
 active_config_path = None
 
 
@@ -522,10 +520,6 @@ def _backend_position_commands_allowed():
     return (
         control_mode == 'position'
         and robot is not None
-        and not gravity_serial_released
-        and not impedance_serial_released
-        and not gravity_transitioning
-        and not impedance_transitioning
     )
 
 
@@ -534,80 +528,6 @@ def _position_target_updates_allowed():
     if demo_mode:
         return control_mode == 'position'
     return _backend_position_commands_allowed()
-
-
-def _snapshot_live_positions():
-    """
-    Capture a verified, fresh position snapshot before a controller handoff.
-
-    The backend must not enter an external controller using a stale position
-    or the driver's invalid sentinel value. Two requests also give the
-    asynchronous serial receive thread time to publish a fresh state.
-    """
-    if robot is None or demo_mode:
-        with state_lock:
-            return positions.copy()
-
-    last_valid = None
-    for _ in range(3):
-        _read_states(wait_after_request=0.02)
-        with state_lock:
-            snapshot = positions.copy()
-            valid = (
-                len(snapshot) == MOTOR_COUNT
-                and np.all(np.isfinite(snapshot))
-                and np.all(np.abs(snapshot) < 100.0)
-            )
-        if valid:
-            last_valid = snapshot
-            break
-        time.sleep(0.01)
-
-    if last_valid is None:
-        raise RuntimeError("无法读取有效的最新关节位置，拒绝切换控制模式")
-    return last_valid
-
-
-def _send_position_hold_before_handoff(current):
-    """Refresh the last position command without sending STOP."""
-    with serial_io_lock:
-        current_robot = robot
-        if current_robot is None or demo_mode:
-            return
-
-        max_torque = float(config.get('robot', {}).get('max_torque', 15.0))
-        cmd = {
-            gid: (float(current[gid - 1]), 0.0, max_torque)
-            for gid in range(1, MOTOR_COUNT + 1)
-        }
-        # Send twice so the most recent command remains a position-hold command
-        # while the Python serial handle is being released.
-        try:
-            current_robot.set_all_pos_vel_max_torque(cmd)
-            time.sleep(0.005)
-            current_robot.set_all_pos_vel_max_torque(cmd)
-            time.sleep(0.005)
-        except Exception as exc:
-            _drop_backend_robot(f"position handoff failed: {exc}", current_robot)
-            raise
-
-
-def _arm_target_from_snapshot(snapshot, group_name):
-    """Return the seven non-gripper joint positions for one arm."""
-    group = config.get('groups', {}).get(group_name, {})
-    motor_indices = group.get('motor_indices', [])
-    gripper_index = group.get('gripper_index', None)
-    values = []
-    for local_index, gid in enumerate(motor_indices):
-        if local_index == gripper_index:
-            continue
-        index = int(gid) - 1
-        if 0 <= index < len(snapshot):
-            values.append(float(snapshot[index]))
-    if len(values) != 7:
-        raise RuntimeError(
-            f"{group_name} arm handoff requires 7 joint positions, got {len(values)}")
-    return values
 
 
 def _configure_impedance_defaults():
@@ -658,88 +578,221 @@ def _set_impedance_targets_from_positions():
         impedance_targets[:] = current
 
 
-def _gravity_runner_path():
-    return SCRIPT_RUNNER
+def _arm_joint_ids_from_config(side):
+    """Return the seven non-gripper global IDs for one arm."""
+    group = config.get('groups', {}).get(side, {})
+    motor_indices = list(group.get('motor_indices', []))
+    joint_names = list(group.get('joint_names', []))
+    gripper_index = group.get('gripper_index', None)
+    ids = []
+    for local_index, gid in enumerate(motor_indices):
+        name = joint_names[local_index] if local_index < len(joint_names) else ""
+        if local_index == gripper_index or 'gripper' in name.lower():
+            continue
+        ids.append(int(gid))
+    if len(ids) != 7:
+        raise RuntimeError(
+            f'{side} arm requires 7 non-gripper joints, got {len(ids)}')
+    return ids
 
 
-def _is_gravity_runner_alive():
-    return gravity_process is not None and gravity_process.poll() is None
+def _configure_arm_dynamics():
+    """Build the Pinocchio dynamics objects used by internal control modes."""
+    global arm_dynamics, arm_joint_ids, dynamics_error
 
-
-def _wait_process_exit(proc, timeout=4.0):
-    """Wait for a child process without sending another control signal."""
-    if proc is None:
-        return True
+    arm_dynamics = {}
+    arm_joint_ids = {}
+    dynamics_error = ""
     try:
-        proc.wait(timeout=timeout)
-        return True
-    except subprocess.TimeoutExpired:
-        return False
-    except Exception:
-        return proc.poll() is not None
+        if SCRIPT_DIR not in sys.path:
+            sys.path.insert(0, SCRIPT_DIR)
+        from litearm_control import (
+            ArmDynamics,
+            DEFAULT_KD,
+            DEFAULT_KP,
+            DEFAULT_TORQUE_LIMIT,
+            LEFT_GRAVITY_GAIN,
+            RIGHT_GRAVITY_GAIN,
+        )
 
+        urdf = config.get('urdf', {})
+        left_urdf = urdf.get('left_arm', '')
+        right_urdf = urdf.get('right_arm', '')
+        if not left_urdf or not right_urdf:
+            raise RuntimeError('left_arm/right_arm URDF paths are missing')
 
-def _terminate_process_group(proc, timeout=4.0):
-    """Gracefully stop a mode process, escalating only if it is stuck."""
-    if proc is None:
-        return
-    if proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGINT)
-        except Exception:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+        params = config.get('impedance', {})
 
-    if _wait_process_exit(proc, timeout):
-        return
+        def first_seven(values, defaults):
+            if isinstance(values, (int, float)):
+                return [float(values)] * 7
+            values = list(values or [])
+            values = values[:7]
+            return values + list(defaults[len(values):7])
 
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    _wait_process_exit(proc, timeout=0.5)
+        kp = first_seven(params.get('kp'), DEFAULT_KP)
+        kd = first_seven(params.get('kd'), DEFAULT_KD)
+        torque_limit = first_seven(
+            params.get('torque_limit'), DEFAULT_TORQUE_LIMIT)
 
-
-def _request_gravity_handoff(proc):
-    """Ask Gravity to exit without STOP, then wait before port transfer."""
-    if proc is None or proc.poll() is not None:
-        return True
-    try:
-        os.killpg(proc.pid, signal.SIGUSR1)
+        arm_joint_ids = {
+            'left': _arm_joint_ids_from_config('left'),
+            'right': _arm_joint_ids_from_config('right'),
+        }
+        arm_dynamics = {
+            'left': ArmDynamics(
+                'left', left_urdf, LEFT_GRAVITY_GAIN, kp, kd, torque_limit),
+            'right': ArmDynamics(
+                'right', right_urdf, RIGHT_GRAVITY_GAIN, kp, kd, torque_limit),
+        }
+        print("[Dynamics] Internal gravity/impedance control ready")
     except Exception as exc:
-        print(f"[Impedance] Gravity handoff signal failed: {exc}")
-        return False
-
-    # The old code waited 50 ms and then sent SIGINT through
-    # _stop_external_gravity(). That could race the SIGUSR1 handler and make
-    # Gravity execute robot.close(stop=True) during the handoff.
-    if _wait_process_exit(proc, timeout=4.0):
-        return True
-
-    print("[Impedance] Gravity did not exit after handoff request; stopping it")
-    _terminate_process_group(proc)
-    return False
+        dynamics_error = str(exc)
+        print(f"[Dynamics] Internal control unavailable: {dynamics_error}")
 
 
-def _release_robot_for_external_gravity():
-    global robot, gravity_serial_released
+def _arm_state(side):
+    """Copy q and dq for one arm from the backend state arrays."""
+    ids = arm_joint_ids.get(side)
+    if not ids:
+        ids = _arm_joint_ids_from_config(side)
+    indices = np.asarray(ids, dtype=np.int64) - 1
+    with state_lock:
+        if np.any(indices < 0) or np.any(indices >= len(positions)):
+            raise RuntimeError(f'{side} arm state indices are out of range')
+        return positions[indices].copy(), velocities[indices].copy()
+
+
+def _arm_impedance_target(side):
+    """Copy the seven configured impedance targets for one arm."""
+    ids = arm_joint_ids.get(side)
+    if not ids:
+        ids = _arm_joint_ids_from_config(side)
+    indices = np.asarray(ids, dtype=np.int64) - 1
+    with impedance_lock:
+        return impedance_targets[indices].copy()
+
+
+def _compute_internal_torques(mode):
+    """Compute clipped gravity or G(q)+PD torques for both arms."""
+    if len(arm_dynamics) != 2:
+        raise RuntimeError(
+            dynamics_error or 'internal arm dynamics are not initialized')
+
+    left_q, left_dq = _arm_state('left')
+    right_q, right_dq = _arm_state('right')
+    if mode == 'gravity_comp':
+        left = arm_dynamics['left']
+        right = arm_dynamics['right']
+        return (
+            left.clip(left.gravity(left_q)),
+            right.clip(right.gravity(right_q)),
+        )
+    if mode == 'impedance':
+        left_terms = arm_dynamics['left'].impedance_terms(
+            left_q, left_dq, _arm_impedance_target('left'))
+        right_terms = arm_dynamics['right'].impedance_terms(
+            right_q, right_dq, _arm_impedance_target('right'))
+        return left_terms.clipped, right_terms.clipped
+    raise ValueError(f'unsupported internal torque mode: {mode}')
+
+
+def _send_internal_torques(left_torque, right_torque):
+    """Send arm MIT feed-forward torques using current joint positions."""
+    if robot is None:
+        return
+
+    command = {}
+    with state_lock:
+        for side, values in (
+            ('left', left_torque),
+            ('right', right_torque),
+        ):
+            ids = arm_joint_ids[side]
+            indices = np.asarray(ids, dtype=np.int64) - 1
+            for gid, index, torque in zip(ids, indices, values):
+                command[gid] = (
+                    float(positions[index]), 0.0, float(torque), 0.0, 0.0)
+
+    with serial_io_lock:
+        current_robot = robot
+        if current_robot is None:
+            return
+        try:
+            current_robot.set_all_pos_vel_torque_kp_kd(command)
+        except Exception as exc:
+            _drop_backend_robot(f'torque command failed: {exc}', current_robot)
+
+
+def _refresh_mode_state():
+    """Read a fresh live state before latching a mode target."""
+    if robot is None or demo_mode:
+        return
+    wait = float(config.get('control', {}).get(
+        'state_wait_after_request', 0.0))
+    _read_states(wait_after_request=wait)
+
+
+def _set_control_mode(mode):
+    """Switch internal modes without releasing the backend serial owner."""
+    global control_mode
+    with mode_transition_lock:
+        previous = control_mode
+        if mode in ('gravity_comp', 'impedance') and not arm_dynamics:
+            raise RuntimeError(
+                dynamics_error or 'internal arm dynamics are unavailable')
+
+        if mode != previous and mode in ('position', 'impedance'):
+            try:
+                _refresh_mode_state()
+            except Exception as exc:
+                print(f"[Mode] state refresh failed during {mode} switch: {exc}")
+
+        if mode == 'position' and previous != 'position':
+            _hold_current_positions()
+        elif mode == 'impedance' and previous != 'impedance':
+            _set_impedance_targets_from_positions()
+
+        control_mode = mode
+
+
+def _apply_control_mode(mode):
+    """Apply a normal backend mode and send the free-mode command if needed."""
+    if mode not in ('position', 'free', 'gravity_comp', 'impedance'):
+        raise ValueError(f'Unknown mode: {mode}')
+
+    if control_mode == 'script':
+        _stop_script(restore_robot=True)
+
+    _set_control_mode(mode)
+    if mode == 'free':
+        with serial_io_lock:
+            current_robot = robot
+            if current_robot is not None:
+                try:
+                    current_robot.set_all_free_mode()
+                except Exception as exc:
+                    _drop_backend_robot(
+                        f"free mode command failed: {exc}",
+                        current_robot)
+    print(f"[Mode] → {mode}")
+    return mode
+
+
+def _release_robot_for_script():
+    """Release serial ownership for the separate arbitrary-script runner."""
+    global robot, script_serial_released
     global backend_serial_fault, backend_serial_fault_message
     with serial_io_lock:
         current_robot = robot
         if current_robot is None or demo_mode:
             if not demo_mode:
-                gravity_serial_released = True
+                script_serial_released = True
                 backend_serial_fault = False
                 backend_serial_fault_message = ""
             return
-        # Do not send STOP here. STOP disables the motor torque before the
-        # gravity script has opened the ports, which causes the arm to drop
-        # when switching from position mode.
+        # Do not send STOP here. STOP disables motor torque before the
+        # external script has opened the ports, which can make the arm drop.
         try:
             current_robot.close_all()
         except Exception:
@@ -747,323 +800,37 @@ def _release_robot_for_external_gravity():
         # A closed manager must not remain visible to the broadcast/control
         # threads while the external Python script owns the serial ports.
         robot = None
-        gravity_serial_released = True
+        script_serial_released = True
         backend_serial_fault = False
         backend_serial_fault_message = ""
 
 
-def _restore_robot_after_external_gravity():
-    global robot, gravity_serial_released
+def _restore_robot_after_script():
+    """Re-open the backend after the separate arbitrary script exits."""
+    global robot, script_serial_released
     global backend_serial_fault, backend_serial_fault_message
-    if demo_mode or not gravity_serial_released:
+    if demo_mode or not script_serial_released:
         return True
     if not active_config_path:
-        gravity_serial_released = False
+        script_serial_released = False
         return False
     with serial_io_lock:
         try:
-            print("[Gravity] Re-opening backend serial connection")
+            print("[Script] Re-opening backend serial connection")
             time.sleep(0.3)
             robot = init_robot(active_config_path)
-            gravity_serial_released = False
+            script_serial_released = False
             _read_states()
             backend_serial_fault = False
             backend_serial_fault_message = ""
             return True
         except Exception as exc:
             robot = None
-            gravity_serial_released = False
+            script_serial_released = False
             backend_serial_fault = True
             backend_serial_fault_message = str(exc)
-            print(f"[Gravity] Failed to re-open backend serial connection: {exc}")
+            print(f"[Script] Failed to re-open backend serial connection: {exc}")
             return False
-
-
-def _start_external_gravity():
-    global gravity_process, control_mode, gravity_transitioning
-    with mode_transition_lock:
-        if demo_mode:
-            return False, "demo mode does not use hardware gravity compensation"
-        if _script_is_alive():
-            return False, f"script already running: {script_name}"
-        if _is_gravity_runner_alive():
-            return True, None
-
-        runner = _gravity_runner_path()
-        if not os.path.exists(runner):
-            return False, f"mode script runner not found: {runner}"
-        if not active_config_path:
-            return False, "active robot config is not available"
-
-        gravity_transitioning = True
-
-        try:
-            current = _snapshot_live_positions()
-            _hold_current_positions(current)
-            _send_position_hold_before_handoff(current)
-            control_mode = 'gravity_comp'
-            _release_robot_for_external_gravity()
-            gravity_process = subprocess.Popen(
-                [
-                    sys.executable,
-                    runner,
-                    '--config',
-                    active_config_path,
-                    '2_gravity_compensation_control.py',
-                ],
-                cwd=BACKEND_DIR,
-                stdout=None,
-                stderr=None,
-                start_new_session=True,
-            )
-            time.sleep(0.3)
-            if gravity_process.poll() is not None:
-                code = gravity_process.returncode
-                gravity_process = None
-                restored = _restore_robot_after_external_gravity()
-                control_mode = 'position' if restored else 'free'
-                return False, f"gravity runner exited immediately with code {code}"
-            print(
-                "[Gravity] External Python script started, "
-                f"pid={gravity_process.pid}, "
-                "script=2_gravity_compensation_control.py"
-            )
-            return True, None
-        except Exception as exc:
-            gravity_process = None
-            restored = _restore_robot_after_external_gravity()
-            control_mode = 'position' if restored else 'free'
-            return False, str(exc)
-        finally:
-            gravity_transitioning = False
-
-
-def _stop_external_gravity(restore_robot=True):
-    global gravity_process, gravity_transitioning, control_mode
-    with mode_transition_lock:
-        owns_transition = not gravity_transitioning
-        if owns_transition:
-            gravity_transitioning = True
-        restored = True
-        try:
-            proc = gravity_process
-            gravity_process = None
-            _terminate_process_group(proc)
-            if restore_robot:
-                restored = _restore_robot_after_external_gravity()
-            # Keep the controller in a neutral state until the caller has
-            # explicitly selected the next mode. This prevents the control
-            # loop from treating the stopping process as an unexpected exit.
-            if restore_robot:
-                control_mode = 'free'
-            return restored
-        finally:
-            if owns_transition:
-                gravity_transitioning = False
-
-
-def _impedance_runner_path():
-    return SCRIPT_RUNNER
-
-
-def _is_impedance_runner_alive():
-    return impedance_process is not None and impedance_process.poll() is None
-
-
-def _release_robot_for_external_impedance():
-    global robot, impedance_serial_released
-    global backend_serial_fault, backend_serial_fault_message
-    with serial_io_lock:
-        current_robot = robot
-        if current_robot is None or demo_mode:
-            if not demo_mode:
-                impedance_serial_released = True
-                backend_serial_fault = False
-                backend_serial_fault_message = ""
-            return
-        # Keep the last position-hold command alive until the Python script
-        # takes the port. Sending STOP here makes impedance entry unsafe.
-        try:
-            current_robot.close_all()
-        except Exception:
-            pass
-        # Do not let backend threads use a closed serial manager while the
-        # external MIT controller owns the ports.
-        robot = None
-        impedance_serial_released = True
-        backend_serial_fault = False
-        backend_serial_fault_message = ""
-
-
-def _restore_robot_after_external_impedance():
-    global robot, impedance_serial_released
-    global backend_serial_fault, backend_serial_fault_message
-    if demo_mode or not impedance_serial_released:
-        return True
-    if not active_config_path:
-        impedance_serial_released = False
-        return False
-    with serial_io_lock:
-        try:
-            print("[Impedance] Re-opening backend serial connection")
-            time.sleep(0.3)
-            robot = init_robot(active_config_path)
-            impedance_serial_released = False
-            _read_states()
-            backend_serial_fault = False
-            backend_serial_fault_message = ""
-            return True
-        except Exception as exc:
-            robot = None
-            impedance_serial_released = False
-            backend_serial_fault = True
-            backend_serial_fault_message = str(exc)
-            print(f"[Impedance] Failed to re-open backend serial connection: {exc}")
-            return False
-
-
-def _start_external_impedance(skip_backend_handoff=False):
-    global impedance_process, control_mode, impedance_transitioning
-    global impedance_serial_released, gravity_serial_released
-    with mode_transition_lock:
-        if demo_mode:
-            return False, "demo mode does not use hardware impedance control"
-        if _script_is_alive():
-            return False, f"script already running: {script_name}"
-        if _is_impedance_runner_alive():
-            return True, None
-
-        runner = _impedance_runner_path()
-        if not os.path.exists(runner):
-            return False, f"mode script runner not found: {runner}"
-        if not active_config_path:
-            return False, "active robot config is not available"
-
-        owns_transition = not impedance_transitioning
-        if owns_transition:
-            impedance_transitioning = True
-        try:
-            left_target = None
-            right_target = None
-            if skip_backend_handoff:
-                # Gravity Python has just released the ports. Keep ownership
-                # on the mode-script side and let impedance latch q_target
-                # directly from its first state read.
-                control_mode = 'impedance'
-                impedance_serial_released = True
-            else:
-                # Capture q_target before releasing the backend serial handle
-                # and pass it explicitly to the Python script.
-                current = _snapshot_live_positions()
-                left_target = _arm_target_from_snapshot(current, 'left')
-                right_target = _arm_target_from_snapshot(current, 'right')
-                with impedance_lock:
-                    impedance_targets[:] = current
-                _hold_current_positions(current)
-                _send_position_hold_before_handoff(current)
-                control_mode = 'impedance'
-                _release_robot_for_external_impedance()
-            command = [
-                sys.executable,
-                runner,
-                '--config',
-                active_config_path,
-                'dual_arm_impedance_compensation.py',
-            ]
-            if left_target is not None and right_target is not None:
-                command.extend([
-                    '--left-target', *[f'{value:.12g}' for value in left_target],
-                    '--right-target', *[f'{value:.12g}' for value in right_target],
-                ])
-            impedance_process = subprocess.Popen(
-                command,
-                cwd=BACKEND_DIR,
-                stdout=None,
-                stderr=None,
-                start_new_session=True,
-            )
-            time.sleep(0.3)
-            if impedance_process.poll() is not None:
-                code = impedance_process.returncode
-                impedance_process = None
-                if skip_backend_handoff:
-                    impedance_serial_released = False
-                    restored = _restore_robot_after_external_gravity()
-                else:
-                    restored = _restore_robot_after_external_impedance()
-                control_mode = 'position' if restored else 'free'
-                return False, f"impedance runner exited immediately with code {code}"
-            if skip_backend_handoff:
-                gravity_serial_released = False
-            print(
-                "[Impedance] External Python script started, "
-                f"pid={impedance_process.pid}, "
-                + ("target latched in Python after Gravity handoff"
-                   if skip_backend_handoff else "target latched from backend")
-                + ", script=dual_arm_impedance_compensation.py"
-            )
-            return True, None
-        except Exception as exc:
-            impedance_process = None
-            if skip_backend_handoff:
-                impedance_serial_released = False
-                restored = _restore_robot_after_external_gravity()
-            else:
-                restored = _restore_robot_after_external_impedance()
-            control_mode = 'position' if restored else 'free'
-            return False, str(exc)
-        finally:
-            if owns_transition:
-                impedance_transitioning = False
-
-
-def _switch_gravity_to_impedance():
-    """Hand serial ownership directly from Gravity Python to Impedance Python."""
-    global control_mode, impedance_transitioning, gravity_transitioning
-    global gravity_process
-    with mode_transition_lock:
-        if not gravity_serial_released:
-            return _start_external_impedance()
-
-        impedance_transitioning = True
-        gravity_transitioning = True
-        try:
-            print("[Impedance] Direct Gravity -> Impedance handoff")
-            # Tell the Gravity script not to send STOP in its finally block.
-            # The last gravity MIT command stays active until the Impedance
-            # script opens the ports and sends its first torque command.
-            proc = gravity_process
-            handoff_ok = _request_gravity_handoff(proc)
-            gravity_process = None
-            if not handoff_ok:
-                _restore_robot_after_external_gravity()
-                control_mode = 'free'
-                return False, "gravity handoff failed before impedance start"
-            return _start_external_impedance(skip_backend_handoff=True)
-        finally:
-            gravity_transitioning = False
-            impedance_transitioning = False
-
-
-def _stop_external_impedance(restore_robot=True):
-    global impedance_process, impedance_transitioning, control_mode
-    with mode_transition_lock:
-        owns_transition = not impedance_transitioning
-        if owns_transition:
-            impedance_transitioning = True
-        restored = True
-        try:
-            proc = impedance_process
-            impedance_process = None
-            _terminate_process_group(proc)
-            if restore_robot:
-                restored = _restore_robot_after_external_impedance()
-            if restore_robot:
-                control_mode = 'free'
-            return restored
-        finally:
-            if owns_transition:
-                impedance_transitioning = False
 
 
 def _script_is_alive():
@@ -1142,8 +909,8 @@ def _watch_script_process(proc, name):
             if script_process is proc:
                 script_process = None
                 script_name = None
-                if gravity_serial_released and not _is_gravity_runner_alive():
-                    restored = _restore_robot_after_external_gravity()
+                if script_serial_released:
+                    restored = _restore_robot_after_script()
                     control_mode = 'position' if restored else 'free'
             socketio.emit('script_status', {
                 'running': False,
@@ -1157,11 +924,6 @@ def _start_script(script):
         return False, 'demo mode does not run hardware scripts'
     if _script_is_alive():
         return False, f'script already running: {script_name}'
-    if _is_gravity_runner_alive():
-        return False, 'gravity compensation is running; stop it first'
-    if _is_impedance_runner_alive():
-        return False, 'impedance control is running; stop it first'
-
     script_path, script_filename = _resolve_script_path(script)
     if not script_path or not os.path.isfile(script_path):
         return False, f'script not found: {script_filename}'
@@ -1173,7 +935,7 @@ def _start_script(script):
     try:
         _hold_current_positions()
         control_mode = 'script'
-        _release_robot_for_external_gravity()
+        _release_robot_for_script()
 
         cmd = [
             sys.executable,
@@ -1206,14 +968,14 @@ def _start_script(script):
             return_code = script_process.returncode
             script_process = None
             script_name = None
-            restored = _restore_robot_after_external_gravity()
+            restored = _restore_robot_after_script()
             control_mode = 'position' if restored else 'free'
             return False, f'script exited immediately with code {return_code}'
         return True, None
     except Exception as exc:
         script_process = None
         script_name = None
-        restored = _restore_robot_after_external_gravity()
+        restored = _restore_robot_after_script()
         control_mode = 'position' if restored else 'free'
         return False, str(exc)
 
@@ -1240,13 +1002,13 @@ def _stop_script(restore_robot=True):
             except Exception:
                 proc.kill()
     if restore_robot:
-        restored = _restore_robot_after_external_gravity()
+        restored = _restore_robot_after_script()
         control_mode = 'position' if restored else 'free'
     return restored
 
 
 def control_loop():
-    """Send position or joint-space impedance commands at control rate."""
+    """Run position, gravity, or impedance control in one backend loop."""
     global running, targets, control_mode
     loop_hz = config.get('control', {}).get('loop_hz', 100)
     gravity_loop_hz = config.get('control', {}).get('gravity_loop_hz', 200)
@@ -1257,67 +1019,47 @@ def control_loop():
 
     while running:
         t0 = time.time()
+        mode = control_mode
         try:
-            if control_mode == 'free':
-                pass
+            # Serialize mode transitions and serial writes. This is the same
+            # ownership model as Panthera: one process, one control loop.
+            with mode_transition_lock:
+                mode = control_mode
+                if mode in ('gravity_comp', 'impedance'):
+                    wait = float(config.get('control', {}).get(
+                        'state_wait_after_request', 0.0))
+                    _read_states(wait_after_request=wait)
+                    left_torque, right_torque = _compute_internal_torques(mode)
+                    _send_internal_torques(left_torque, right_torque)
 
-            elif control_mode == 'gravity_comp':
-                # The external Python mode script owns the serial ports.
-                if (gravity_serial_released and not gravity_transitioning
-                        and not impedance_transitioning
-                        and not _is_gravity_runner_alive()
-                        and not _script_is_alive()):
-                    print("[Gravity] External script stopped unexpectedly; restoring backend serial")
-                    restored = _stop_external_gravity(restore_robot=True)
-                    control_mode = 'free'
-                pass
-
-            elif control_mode == 'script':
-                # External demo script owns the serial ports.
-                pass
-
-            elif control_mode == 'impedance':
-                # The Python impedance script owns both serial ports.
-                if (impedance_serial_released and not impedance_transitioning
-                        and not _is_impedance_runner_alive()):
-                    print("[Impedance] External script stopped unexpectedly; restoring backend serial")
-                    restored = _stop_external_impedance(restore_robot=True)
-                    control_mode = 'free'
-
-            elif control_mode == 'position':
-                # Check the mode and send under the same transition lock.
-                # Otherwise a stale position command can race a mode handoff
-                # between the condition check and the serial write.
-                with mode_transition_lock:
-                    if _backend_position_commands_allowed():
-                        cmd = {}
-                        default_vel = float(
-                            config.get('control', {}).get(
-                                'default_velocity', 0.5))
-                        max_torque = float(
-                            config.get('robot', {}).get(
-                                'max_torque', 15.0))
-                        with target_lock:
-                            for gid, tgt in targets.items():
-                                cmd[gid] = (
-                                    float(tgt), default_vel, max_torque)
-                        if cmd:
-                            with serial_io_lock:
-                                current_robot = robot
-                                if current_robot is not None:
-                                    try:
-                                        current_robot.set_all_pos_vel_max_torque(
-                                            cmd)
-                                    except Exception as exc:
-                                        _drop_backend_robot(
-                                            f"position command failed: {exc}",
-                                            current_robot)
+                elif mode == 'position' and _backend_position_commands_allowed():
+                    cmd = {}
+                    default_vel = float(
+                        config.get('control', {}).get(
+                            'default_velocity', 0.5))
+                    max_torque = float(
+                        config.get('robot', {}).get('max_torque', 15.0))
+                    with target_lock:
+                        for gid, tgt in targets.items():
+                            cmd[gid] = (
+                                float(tgt), default_vel, max_torque)
+                    if cmd:
+                        with serial_io_lock:
+                            current_robot = robot
+                            if current_robot is not None:
+                                try:
+                                    current_robot.set_all_pos_vel_max_torque(
+                                        cmd)
+                                except Exception as exc:
+                                    _drop_backend_robot(
+                                        f"position command failed: {exc}",
+                                        current_robot)
         except Exception as e:
             print(f"[Control] Error: {e}")
 
-        if control_mode == 'gravity_comp':
+        if mode == 'gravity_comp':
             active_hz = gravity_loop_hz
-        elif control_mode == 'impedance':
+        elif mode == 'impedance':
             active_hz = impedance_loop_hz
         else:
             active_hz = loop_hz
@@ -1357,11 +1099,9 @@ def state_broadcast_loop():
     while running:
         t0 = time.time()
         try:
-            external_serial_owner = (
-                gravity_serial_released or impedance_serial_released)
+            external_serial_owner = script_serial_released
             if robot is not None or external_serial_owner:
-                if robot is not None and control_mode not in (
-                        'gravity_comp', 'impedance', 'script'):
+                if robot is not None and control_mode != 'script':
                     _read_states()
 
                 # Build state dict — per-group slices from config
@@ -1468,6 +1208,8 @@ def api_config():
         'connected': connected,
         'backend_serial_fault': backend_serial_fault,
         'backend_serial_fault_message': backend_serial_fault_message,
+        'dynamics_ready': bool(arm_dynamics),
+        'dynamics_error': dynamics_error,
         'control_mode': control_mode,
         'joints': joints,
         'groups': groups,
@@ -1494,6 +1236,8 @@ def api_status():
             'connected': connected,
             'backend_serial_fault': backend_serial_fault,
             'backend_serial_fault_message': backend_serial_fault_message,
+            'dynamics_ready': bool(arm_dynamics),
+            'dynamics_error': dynamics_error,
             'timestamp': time.time(),
         })
 
@@ -1579,14 +1323,12 @@ def api_home():
 def api_stop():
     """Stop all motors (send stop command)."""
     global control_mode
-    restored = True
     if _script_is_alive():
-        restored = _stop_script(restore_robot=True) and restored
-    if _is_gravity_runner_alive():
-        restored = _stop_external_gravity(restore_robot=True) and restored
-    if _is_impedance_runner_alive():
-        restored = _stop_external_impedance(restore_robot=True) and restored
-    control_mode = 'position' if restored else 'free'
+        _stop_script(restore_robot=True)
+    try:
+        _set_control_mode('position')
+    except Exception:
+        control_mode = 'free'
     with serial_io_lock:
         current_robot = robot
         if current_robot is not None:
@@ -1606,52 +1348,15 @@ def api_stop():
 @app.route('/api/set_mode', methods=['POST'])
 def api_set_mode():
     global control_mode
-    data = flask_request.get_json()
+    data = flask_request.get_json(silent=True) or {}
     mode = data.get('mode', 'position')
     if mode not in ('position', 'free', 'gravity_comp', 'impedance'):
         return jsonify({'error': f'Unknown mode: {mode}'}), 400
-    if control_mode == 'script' and mode != 'script':
-        _stop_script(restore_robot=True)
-    if mode == 'gravity_comp':
-        if control_mode == 'impedance':
-            restored = _stop_external_impedance(restore_robot=True)
-            if not restored:
-                return jsonify({'error': 'failed to restore backend serial before gravity mode'}), 503
-        ok, error = _start_external_gravity()
-        if not ok:
-            return jsonify({'error': error}), 503
-    elif mode == 'impedance':
-        if control_mode == 'gravity_comp':
-            ok, error = _switch_gravity_to_impedance()
-        else:
-            ok, error = _start_external_impedance()
-        if not ok:
-            return jsonify({'error': error}), 503
-    if control_mode == 'gravity_comp' and mode not in ('gravity_comp', 'impedance'):
-        restored = _stop_external_gravity(restore_robot=True)
-        if restored:
-            _hold_current_positions()
-        else:
-            mode = 'free'
-    if control_mode == 'impedance' and mode != 'impedance':
-        restored = _stop_external_impedance(restore_robot=True)
-        if restored:
-            _hold_current_positions()
-        else:
-            mode = 'free'
-    control_mode = mode
-    if mode == 'free':
-        with serial_io_lock:
-            current_robot = robot
-            if current_robot is not None:
-                try:
-                    current_robot.set_all_free_mode()
-                except Exception as exc:
-                    _drop_backend_robot(
-                        f"free mode command failed: {exc}",
-                        current_robot)
+    try:
+        _apply_control_mode(mode)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 503
     socketio.emit('mode_changed', {'mode': mode})
-    print(f"[Mode] → {mode}")
     return jsonify({'ok': True, 'mode': mode})
 
 
@@ -1765,6 +1470,8 @@ def on_connect():
         'connected': connected,
         'backend_serial_fault': backend_serial_fault,
         'backend_serial_fault_message': backend_serial_fault_message,
+        'dynamics_ready': bool(arm_dynamics),
+        'dynamics_error': dynamics_error,
         'joints': build_joint_list(config),
         'groups': {g: {'name': gi.get('name', g),
                        'joint_count': len(gi['joint_names']),
@@ -1859,14 +1566,12 @@ def ws_reset_all(data=None):
 @socketio.on('stop')
 def ws_stop(data=None):
     global control_mode
-    restored = True
     if _script_is_alive():
-        restored = _stop_script(restore_robot=True) and restored
-    if _is_gravity_runner_alive():
-        restored = _stop_external_gravity(restore_robot=True) and restored
-    if _is_impedance_runner_alive():
-        restored = _stop_external_impedance(restore_robot=True) and restored
-    control_mode = 'position' if restored else 'free'
+        _stop_script(restore_robot=True)
+    try:
+        _set_control_mode('position')
+    except Exception:
+        control_mode = 'free'
     with serial_io_lock:
         current_robot = robot
         if current_robot is not None:
@@ -1882,100 +1587,29 @@ def ws_gravity_comp(data=None):
     """Toggle gravity compensation mode."""
     global control_mode
     enable = data.get('enable', True) if isinstance(data, dict) else True
-    if enable:
-        if control_mode == 'impedance':
-            restored = _stop_external_impedance(restore_robot=True)
-            if not restored:
-                print("[Gravity] Compensation rejected: failed to restore backend serial before gravity mode")
-                socketio.emit('backend_error', {
-                    'message': '重力补偿启动失败: 后端串口恢复失败'
-                })
-                return
-        ok, error = _start_external_gravity()
-        if not ok:
-            print(f"[Gravity] Compensation rejected: {error}")
-            socketio.emit('backend_error', {
-                'message': f'重力补偿启动失败: {error}'
-            })
-            return
-        control_mode = 'gravity_comp'
-        print("[Gravity] Compensation ENABLED via Python script")
-    else:
-        restored = True
-        if control_mode == 'gravity_comp':
-            restored = _stop_external_gravity(restore_robot=True)
-            if restored:
-                _hold_current_positions()
-        elif control_mode == 'impedance':
-            restored = _stop_external_impedance(restore_robot=True)
-            if restored:
-                _hold_current_positions()
-        control_mode = 'position' if restored else 'free'
-        print("[Gravity] Compensation DISABLED → position mode")
+    mode = 'gravity_comp' if enable else 'position'
+    try:
+        _apply_control_mode(mode)
+    except Exception as exc:
+        print(f"[Gravity] Compensation rejected: {exc}")
+        socketio.emit('backend_error', {
+            'message': f'重力补偿启动失败: {exc}'
+        })
+        return
     socketio.emit('mode_changed', {'mode': control_mode})
 
 
 @socketio.on('set_mode')
 def ws_set_mode(data):
     global control_mode
-    mode = data.get('mode', 'position')
+    mode = data.get('mode', 'position') if isinstance(data, dict) else 'position'
     if mode in ('position', 'free', 'gravity_comp', 'impedance'):
-        if control_mode == 'script':
-            _stop_script(restore_robot=True)
-        if mode == 'gravity_comp':
-            if control_mode == 'impedance':
-                restored = _stop_external_impedance(restore_robot=True)
-                if not restored:
-                    print("[Gravity] Mode change rejected: failed to restore backend serial before gravity mode")
-                    socketio.emit('backend_error', {
-                        'message': '重力补偿启动失败: 后端串口恢复失败'
-                    })
-                    return
-            ok, error = _start_external_gravity()
-            if not ok:
-                print(f"[Gravity] Mode change rejected: {error}")
-                socketio.emit('backend_error', {
-                    'message': f'重力补偿启动失败: {error}'
-                })
-                return
-        elif mode == 'impedance':
-            if control_mode == 'gravity_comp':
-                ok, error = _switch_gravity_to_impedance()
-            else:
-                ok, error = _start_external_impedance()
-            if not ok:
-                print(f"[Impedance] Mode change rejected: {error}")
-                socketio.emit('backend_error', {
-                    'message': f'阻抗模式启动失败: {error}'
-                })
-                return
-        if control_mode == 'gravity_comp' and mode not in ('gravity_comp', 'impedance'):
-            restored = _stop_external_gravity(restore_robot=True)
-            if restored:
-                _hold_current_positions()
-            else:
-                mode = 'free'
-        if control_mode == 'impedance' and mode != 'impedance':
-            restored = _stop_external_impedance(restore_robot=True)
-            if restored:
-                _hold_current_positions()
-            else:
-                mode = 'free'
-        control_mode = mode
-        if mode == 'gravity_comp':
-            print("[Gravity] Compensation ENABLED via Python script")
-        elif mode == 'impedance':
-            print("[Impedance] Joint-space G(q)+Kp(qd-q)-Kd*dq ENABLED")
-        elif mode == 'free':
-            with serial_io_lock:
-                current_robot = robot
-                if current_robot is not None:
-                    try:
-                        current_robot.set_all_free_mode()
-                    except Exception as exc:
-                        _drop_backend_robot(
-                            f"free mode command failed: {exc}",
-                            current_robot)
+        try:
+            _apply_control_mode(mode)
+        except Exception as exc:
+            print(f"[Mode] change rejected: {exc}")
+            socketio.emit('backend_error', {'message': str(exc)})
+            return
         socketio.emit('mode_changed', {'mode': mode})
 
 
@@ -1997,6 +1631,7 @@ def init_robot(cfg_path):
     cfg = load_config(cfg_path)
     cfg = resolve_serial_ports(cfg)
     config.update(cfg)
+    _configure_arm_dynamics()
     print(f"   Robot: {cfg['robot']['name']}")
     print(f"   Groups: {list(cfg['groups'].keys())}")
 
@@ -2055,6 +1690,7 @@ def init_demo():
     connected = False
     backend_serial_fault = False
     backend_serial_fault_message = ""
+    _configure_arm_dynamics()
     with target_lock:
         for i in range(1, MOTOR_COUNT + 1):
             targets[i] = 0.0
@@ -2136,8 +1772,6 @@ def main():
         if not demo_mode:
             try:
                 _stop_script(restore_robot=False)
-                _stop_external_gravity(restore_robot=False)
-                _stop_external_impedance(restore_robot=False)
             except Exception:
                 pass
         if robot is not None and not demo_mode:
