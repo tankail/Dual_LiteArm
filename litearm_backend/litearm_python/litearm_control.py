@@ -40,8 +40,8 @@ DEFAULT_CONFIG = os.path.join(BACKEND_DIR, "robot_param", "litearm_arms.yaml")
 
 LEFT_GRAVITY_GAIN = np.array([0.85, 1.0, 1.0, 0.8, 1.0, 1.0, 1.0])
 RIGHT_GRAVITY_GAIN = np.array([1.0, 1.2, 1.0, 0.8, 1.0, 1.0, 1.0])
-DEFAULT_KP = np.array([6.0, 12.0, 12.0, 4.5, 3.0, 1.5, 1.2])
-DEFAULT_KD = np.array([0.9, 1.2, 1.2, 0.6, 0.375, 0.225, 0.15])
+DEFAULT_KP = np.array([15.0, 30.0, 30.0, 12.0, 7.5, 4.5, 3.75])
+DEFAULT_KD = np.array([2.25, 3.0, 3.0, 1.5, 1.125, 0.675, 0.45])
 DEFAULT_TORQUE_LIMIT = np.array([15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0])
 DEFAULT_FEEDBACK_LIMIT_TOLERANCE_RAD = 0.05
 DEFAULT_FEEDBACK_JUMP_TOLERANCE_RAD = 0.35
@@ -269,6 +269,36 @@ class ArmDynamics:
         pd = self.kp * (target_arr - q_arr) - self.kd * dq_arr
         total = gravity + pd
         return TorqueTerms(gravity=gravity, pd=pd, total=total, clipped=self.clip(total))
+
+    def frame_jacobian(
+        self,
+        q: Iterable[float],
+        frame_name: str,
+    ) -> np.ndarray:
+        """Return a 6x7 Jacobian in the world-aligned frame.
+
+        Pinocchio orders the spatial Jacobian as linear velocity followed by
+        angular velocity.  The returned matrix is therefore compatible with
+        wrench = [Fx, Fy, Fz, Mx, My, Mz].
+        """
+        q_values = _as_float_array(q, self.dof, "q")
+        q_model = np.zeros(self.model.nq, dtype=np.float64)
+        for i in range(min(self.model.nq, q_values.size)):
+            q_model[i] = q_values[i]
+
+        frame_id = self.model.getFrameId(str(frame_name))
+        if frame_id >= self.model.nframes:
+            raise ValueError(f"frame not found in {self.side} URDF: {frame_name}")
+
+        pin.computeJointJacobians(self.model, self.data, q_model)
+        pin.updateFramePlacements(self.model, self.data)
+        frame_jacobian = pin.getFrameJacobian(
+            self.model,
+            self.data,
+            frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        return np.asarray(frame_jacobian, dtype=np.float64)[:, :self.dof].copy()
 
 
 class DualLiteArmPython:

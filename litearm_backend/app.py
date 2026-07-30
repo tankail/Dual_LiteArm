@@ -96,6 +96,12 @@ impedance_torque_limits = np.array([], dtype=np.float64)
 arm_dynamics = {}
 arm_joint_ids = {}
 dynamics_error = ""
+external_wrench_lock = threading.Lock()
+external_wrench_estimates = {
+    'left': np.zeros(6, dtype=np.float64),
+    'right': np.zeros(6, dtype=np.float64),
+}
+external_wrench_initialized = {'left': False, 'right': False}
 KEYBOARD_MODES = {
     'left_keyboard': 'left',
     'right_keyboard': 'right',
@@ -579,8 +585,8 @@ def _configure_impedance_defaults():
     global impedance_targets, impedance_kp, impedance_kd, impedance_torque_limits
 
     params = config.get('impedance', {})
-    default_kp = [4.0, 8.0, 8.0, 3.0, 2.0, 1.0, 0.8, 0.0]
-    default_kd = [0.6, 0.8, 0.8, 0.4, 0.25, 0.15, 0.1, 0.0]
+    default_kp = [15.0, 30.0, 30.0, 12.0, 7.5, 4.5, 3.75, 0.0]
+    default_kd = [2.25, 3.0, 3.0, 1.5, 1.125, 0.675, 0.45, 0.0]
     default_limit = [15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0, 2.0]
     kp_values = params.get('kp', default_kp)
     kd_values = params.get('kd', default_kd)
@@ -960,6 +966,131 @@ def _arm_state(side):
         return positions[indices].copy(), velocities[indices].copy()
 
 
+def _arm_feedback(side):
+    """Copy q, dq, and current-loop torque feedback for one arm."""
+    ids = arm_joint_ids.get(side)
+    if not ids:
+        ids = _arm_joint_ids_from_config(side)
+    indices = np.asarray(ids, dtype=np.int64) - 1
+    with state_lock:
+        if np.any(indices < 0) or np.any(indices >= len(positions)):
+            raise RuntimeError(f'{side} arm state indices are out of range')
+        return (
+            positions[indices].copy(),
+            velocities[indices].copy(),
+            torques[indices].copy(),
+        )
+
+
+def _clear_external_wrench_estimates():
+    """Clear filtered external wrench values on mode changes."""
+    with external_wrench_lock:
+        for side in ('left', 'right'):
+            external_wrench_estimates[side].fill(0.0)
+            external_wrench_initialized[side] = False
+
+
+def _external_wrench_snapshot():
+    """Return filtered [force, moment] estimates for both arms."""
+    with external_wrench_lock:
+        return {
+            side: external_wrench_estimates[side].copy()
+            for side in ('left', 'right')
+        }
+
+
+def _external_wrench_vector_param(name, default):
+    params = config.get('external_wrench', {})
+    value = params.get(name, default)
+    if isinstance(value, (int, float)):
+        return np.full(7, float(value), dtype=np.float64)
+    values = list(value or [])
+    values = [float(v) for v in values[:7]]
+    return np.asarray(values + list(default[len(values):7]), dtype=np.float64)
+
+
+def _external_wrench_friction(dq):
+    """Panthera-style Coulomb + viscous friction estimate for seven joints."""
+    default_fc = [0.10, 0.12, 0.12, 0.08, 0.03, 0.02, 0.02]
+    default_fv = [0.04, 0.06, 0.06, 0.04, 0.02, 0.02, 0.02]
+    params = config.get('external_wrench', {})
+    fc = _external_wrench_vector_param('friction_coulomb', default_fc)
+    fv = _external_wrench_vector_param('friction_viscous', default_fv)
+    threshold = float(params.get('velocity_threshold', 0.02))
+    dq = np.asarray(dq, dtype=np.float64)[:7]
+    full = fc * np.sign(dq) + fv * dq
+    low_speed = fv * dq
+    return np.where(np.abs(dq) < threshold, low_speed, full)
+
+
+def _update_external_wrench_estimates():
+    """Estimate end-effector external wrench from current-loop torque.
+
+    MotorState.torque is already converted to Nm by motor_driver.py.  This
+    follows Panthera's residual definition: subtract the model torque
+    (gravity plus Coulomb/viscous friction), then map the remaining joint
+    torque to the configured TCP frame.  For a redundant 7-DOF arm, the
+    damped least-squares solution of J.T @ wrench = tau_external is:
+
+        wrench = (J J.T + lambda^2 I)^-1 J tau_external
+
+    The frontend displays wrench[0:3] (force) and wrench[3:6] (moment) at
+    the configured end-effector frame origin.
+    """
+    if len(arm_dynamics) != 2 or not HAS_PINOCCHIO:
+        _clear_external_wrench_estimates()
+        return
+
+    params = config.get('external_wrench', {})
+    damping = max(float(params.get('dls_damping', 0.05)), 1.0e-6)
+    alpha = float(params.get('filter_alpha', 0.2))
+    alpha = max(0.0, min(1.0, alpha))
+
+    for side in ('left', 'right'):
+        try:
+            q, dq, measured_torque = _arm_feedback(side)
+            ee_name = config.get('groups', {}).get(side, {}).get(
+                'end_effector_link', '')
+            if not ee_name:
+                raise RuntimeError(f'{side} end-effector link is missing')
+
+            model_torque = (
+                arm_dynamics[side].gravity(q)
+                + _external_wrench_friction(dq)
+            )
+            tau_external = measured_torque[:7] - model_torque
+            J = arm_dynamics[side].frame_jacobian(q, ee_name)
+            if J.shape != (6, 7):
+                raise RuntimeError(
+                    f'{side} Jacobian shape is {J.shape}, expected (6, 7)')
+
+            jjt = J @ J.T
+            rhs = J @ tau_external
+            wrench = np.linalg.solve(
+                jjt + damping * damping * np.eye(6),
+                rhs,
+            )
+            wrench = np.asarray(wrench, dtype=np.float64)
+            if not np.all(np.isfinite(wrench)):
+                raise RuntimeError(f'{side} external wrench is not finite')
+
+            with external_wrench_lock:
+                # Start at zero and ramp in the first valid sample, matching
+                # Panthera's low-pass behavior after an impedance transition.
+                if not external_wrench_initialized[side]:
+                    external_wrench_estimates[side].fill(0.0)
+                    external_wrench_initialized[side] = True
+                external_wrench_estimates[side] = (
+                    alpha * wrench
+                    + (1.0 - alpha) * external_wrench_estimates[side]
+                )
+        except Exception as exc:
+            # Keep the last valid filtered estimate; a transient FK/Jacobian
+            # failure must not create a visible false torque arrow.
+            if dynamics_error == "":
+                print(f"[Wrench] {side} estimate skipped: {exc}")
+
+
 def _arm_impedance_target(side):
     """Copy the seven configured impedance targets for one arm."""
     ids = arm_joint_ids.get(side)
@@ -1067,6 +1198,10 @@ def _set_control_mode(mode):
                 active_keys.clear()
 
         control_mode = mode
+        if mode != 'impedance':
+            _clear_external_wrench_estimates()
+        elif previous != 'impedance':
+            _clear_external_wrench_estimates()
 
 
 def _apply_control_mode(mode):
@@ -1501,6 +1636,8 @@ def control_loop():
                         'state_wait_after_request', 0.0))
                     _read_states(wait_after_request=wait)
                     left_torque, right_torque = _compute_internal_torques(mode)
+                    if mode == 'impedance':
+                        _update_external_wrench_estimates()
                     _send_internal_torques(left_torque, right_torque)
 
                 elif mode in KEYBOARD_MODES:
@@ -1603,6 +1740,29 @@ def state_broadcast_loop():
                     'backend_serial_fault_message': backend_serial_fault_message,
                     'timestamp': time.time(),
                 }
+                wrench_snapshot = _external_wrench_snapshot()
+                state['left_external_wrench'] = (
+                    wrench_snapshot['left'].tolist()
+                    if control_mode == 'impedance'
+                    else [0.0] * 6
+                )
+                state['right_external_wrench'] = (
+                    wrench_snapshot['right'].tolist()
+                    if control_mode == 'impedance'
+                    else [0.0] * 6
+                )
+                state['left_external_moment'] = (
+                    state['left_external_wrench'][3:6]
+                )
+                state['left_external_force'] = (
+                    state['left_external_wrench'][:3]
+                )
+                state['right_external_moment'] = (
+                    state['right_external_wrench'][3:6]
+                )
+                state['right_external_force'] = (
+                    state['right_external_wrench'][:3]
+                )
 
                 # ── Left arm: FK + group state ──
                 left_group = config.get('groups', {}).get('left')
@@ -1615,7 +1775,14 @@ def state_broadcast_loop():
                     left_arm_joints_fk = [n for n in left_group.get('joint_names', []) if 'gripper' not in n.lower()]
                     left_fk_pos = left_all[:len(left_arm_joints_fk)]
                     left_fk = fk.compute(left_fk_pos, 'left') if fk else None
-                    state['left'] = {'positions': left_all, 'fk': left_fk}
+                    state['left'] = {
+                        'positions': left_all,
+                        'torques': torques[left_start:left_end].tolist(),
+                        'fk': left_fk,
+                        'external_wrench': state['left_external_wrench'],
+                        'external_force': state['left_external_force'],
+                        'external_moment': state['left_external_moment'],
+                    }
                     # Primary FK = left arm (Panthera-compatible)
                     state['forward_kinematics'] = left_fk
                     state['ee_position'] = left_fk['position'] if left_fk else [0, 0, 0]
@@ -1628,7 +1795,10 @@ def state_broadcast_loop():
                     state['ee_euler'] = [0, 0, 0]
                     state['gripper_position'] = 0.0
                     state['left_gripper_position'] = 0.0
-                state['external_wrench'] = [0, 0, 0, 0, 0, 0]
+                # Keep the legacy top-level field mapped to the left arm.
+                state['external_wrench'] = state['left_external_wrench']
+                state['external_force'] = state['left_external_force']
+                state['external_moment'] = state['left_external_moment']
 
                 # ── Right arm: FK + group state ──
                 right_group = config.get('groups', {}).get('right')
@@ -1640,7 +1810,14 @@ def state_broadcast_loop():
                     right_arm_joints_fk = [n for n in right_group.get('joint_names', []) if 'gripper' not in n.lower()]
                     right_fk_pos = right_all[:len(right_arm_joints_fk)]
                     right_fk = fk.compute(right_fk_pos, 'right') if fk else None
-                    state['right'] = {'positions': right_all, 'fk': right_fk}
+                    state['right'] = {
+                        'positions': right_all,
+                        'torques': torques[right_start:right_end].tolist(),
+                        'fk': right_fk,
+                        'external_wrench': state['right_external_wrench'],
+                        'external_force': state['right_external_force'],
+                        'external_moment': state['right_external_moment'],
+                    }
                     state['right_gripper_position'] = float(right_all[-1]) if len(right_all) == len(right_ids) else 0.0
 
                 # ── Optional groups (waist, head) ──
@@ -1701,12 +1878,29 @@ def api_config():
             'torque_limit': impedance_torque_limits.tolist(),
         },
         'end_effector_link': config.get('groups', {}).get('left', {}).get('end_effector_link', ''),
-        'end_effector_offset': 0.07,
+        'end_effector_links': {
+            side: config.get('groups', {}).get(side, {}).get(
+                'end_effector_link', '')
+            for side in ('left', 'right')
+        },
+        'external_wrench': {
+            'source': 'current_loop_torque_minus_gravity_friction_tcp_jacobian',
+            'dls_damping': float(config.get(
+                'external_wrench', {}).get('dls_damping', 0.05)),
+            'filter_alpha': float(config.get(
+                'external_wrench', {}).get('filter_alpha', 0.2)),
+            'velocity_threshold': float(config.get(
+                'external_wrench', {}).get('velocity_threshold', 0.02)),
+            'display': 'external_force_and_moment',
+        },
+        # The FK and wrench reference point is the hand TCP frame itself.
+        'end_effector_offset': 0.0,
     })
 
 
 @app.route('/api/status')
 def api_status():
+    wrench_snapshot = _external_wrench_snapshot()
     with state_lock:
         return jsonify({
             'positions': positions.tolist(),
@@ -1718,6 +1912,8 @@ def api_status():
             'backend_serial_fault_message': backend_serial_fault_message,
             'dynamics_ready': bool(arm_dynamics),
             'dynamics_error': dynamics_error,
+            'left_external_wrench': wrench_snapshot['left'].tolist(),
+            'right_external_wrench': wrench_snapshot['right'].tolist(),
             'timestamp': time.time(),
         })
 

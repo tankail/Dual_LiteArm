@@ -24,7 +24,7 @@ groups:
       lower: [-3.0543, -2.8623, -1.5708, -2.4435, -1.5708, -0.76794, -1.5708, 0.0]
       upper: [1.6581, 0.27925, 1.5708, 1.5708, 1.5708, 0.76794, 1.5708, 1.8]
     gripper_index: 7   # index within this group's joint_names that is the gripper
-    end_effector_link: "l_joint7_link"
+    end_effector_link: "l_hand_tcp_link"
 
   right:
     name: "右臂"
@@ -42,7 +42,7 @@ groups:
       lower: [-1.6581, -0.27925, -1.5708, -1.5708, -2.5, -0.76794, -1.5708, 0.0]
       upper: [3.0543, 2.8623, 1.5708, 2.4435, 2.5, 0.76794, 1.5708, 1.8]
     gripper_index: 7
-    end_effector_link: "r_joint7_link"
+    end_effector_link: "r_hand_tcp_link"
 
 # ── 串口到本地电机ID映射 (传给 MultiMotorManager) ──
 ports:
@@ -82,6 +82,17 @@ control:
 # tau = G(q) + Kp * (q_target - q) - Kd * dq
 # 下面每组 8 个参数按左/右臂电机的本地顺序复用，最后一个为夹爪。
 impedance:
-  kp: [6.0, 12.0, 12.0, 4.5, 3.0, 1.5, 1.2, 0.0]
-  kd: [0.9, 1.2, 1.2, 0.6, 0.375, 0.225, 0.15, 0.0]
+  kp: [15.0, 30.0, 30.0, 12.0, 7.5, 4.5, 3.75, 0.0]
+  kd: [2.25, 3.0, 3.0, 1.5, 1.125, 0.675, 0.45, 0.0]
   torque_limit: [15.0, 25.0, 25.0, 15.0, 6.0, 6.0, 4.0, 2.0]
+
+# 阻抗模式下的末端外力/外力矩估计：
+# 参考 Panthera：tau_external = tau_current_feedback - G(q) - friction(dq)
+# wrench = (J J^T + lambda^2 I)^-1 J tau_external
+# wrench = [Fx, Fy, Fz, Mx, My, Mz]，前端显示外力和外力矩箭头。
+external_wrench:
+  dls_damping: 0.05
+  filter_alpha: 0.2
+  friction_coulomb: [0.10, 0.12, 0.12, 0.08, 0.03, 0.02, 0.02]
+  friction_viscous: [0.04, 0.06, 0.06, 0.04, 0.02, 0.02, 0.02]
+  velocity_threshold: 0.02

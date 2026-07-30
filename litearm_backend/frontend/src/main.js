@@ -42,19 +42,26 @@ class DigitalTwinApp {
         this.scriptControlUI = null;
         this.robotConfig = null;
         this.isConnectedMode = false;
-        this.endEffectorOffset = 0.07;  // Backend FK display offset; marker uses configured end_effector_link.
+        this.endEffectorOffset = 0.0;  // The configured hand TCP is the reference point.
         this.endEffectorLinkName = null;
-        this.endEffectorMarkerOffset = new THREE.Vector3(0.16555, 0, 0);
-        this.endEffectorMarker = null;  // Red dot showing actual end effector position
+        this.endEffectorLinks = { left: null, right: null };
+        this.endEffectorMarkerOffset = new THREE.Vector3(0, 0, 0);
+        this.endEffectorMarkers = { left: null, right: null };
+        this.endEffectorMarker = null;  // Backward-compatible alias for left marker
         this.arrowOffset = new THREE.Vector3(0, 0, 0);
 
-        // Force/torque 3D arrows (custom cylinder+cone for thick lines)
-        this.forceArrow = null;
-        this.torqueArrow = null;
-        this.FORCE_SCALE = 5e-3;   // 10N → 50mm arrow
-        this.TORQUE_SCALE = 1e-3;  // 4Nm → 4mm arrow
-        this.FORCE_THRESHOLD = 0.5;
-        this.TORQUE_THRESHOLD = 0.1;
+        // External force/moment arrows (custom cylinder+cone for thick lines)
+        this.forceArrows = { left: null, right: null };
+        this.forceArrow = null;  // Backward-compatible alias for left arrow
+        this.torqueArrows = { left: null, right: null };
+        this.torqueArrow = null;  // Backward-compatible alias for left arrow
+        this.FORCE_SCALE = 8e-3;
+        this.TORQUE_SCALE = 5e-2;  // 0.2Nm → 10mm arrow
+        this.FORCE_MIN_LENGTH = 0.012;
+        this.TORQUE_MIN_LENGTH = 0.025;
+        this.MAX_WRENCH_ARROW_LENGTH = 0.25;
+        this.FORCE_THRESHOLD = 0.05;
+        this.TORQUE_THRESHOLD = 0.01;
         this.SHAFT_RADIUS = 0.005;  // 5mm thick shaft
         this.HEAD_LENGTH = 0.020;   // 20mm cone head
         this.HEAD_RADIUS = 0.010;   // 10mm cone radius
@@ -223,7 +230,11 @@ class DigitalTwinApp {
             this.robotConfig = config;
             this.isConnectedMode = true;
             this.endEffectorOffset = config.end_effector_offset || 0;
-            this.endEffectorLinkName = config.end_effector_link || null;
+            this.endEffectorLinkName = config.end_effector_link || 'l_hand_tcp_link';
+            this.endEffectorLinks = {
+                left: config.end_effector_links?.left || 'l_hand_tcp_link',
+                right: config.end_effector_links?.right || 'r_hand_tcp_link',
+            };
 
             // Enable connected mode in joint controls
             this.jointControlsUI.setConnectedMode(true);
@@ -265,9 +276,13 @@ class DigitalTwinApp {
             // Update FK panel status
             this.updateFKStatus(false, 'Not connected');
 
-            // Hide force/torque arrows
-            if (this.forceArrow) this.forceArrow.visible = false;
-            if (this.torqueArrow) this.torqueArrow.visible = false;
+            // Hide external wrench arrows until impedance data arrives
+            Object.values(this.forceArrows).forEach((arrow) => {
+                if (arrow) arrow.visible = false;
+            });
+            Object.values(this.torqueArrows).forEach((arrow) => {
+                if (arrow) arrow.visible = false;
+            });
         };
 
         // On robot state update (real-time position streaming)
@@ -292,11 +307,16 @@ class DigitalTwinApp {
                 });
             }
 
-            // Update external wrench display and 3D arrows (only in impedance mode)
-            if (state.control_mode === 'impedance' && state.external_wrench) {
-                this.updateExternalWrench(state.external_wrench);
+            // Display the estimated external wrench in impedance mode.
+            if (state.control_mode === 'impedance') {
+                const leftWrench = state.left_external_wrench
+                    || state.left?.external_wrench
+                    || state.external_wrench;
+                const rightWrench = state.right_external_wrench
+                    || state.right?.external_wrench;
+                this.updateExternalWrench('left', leftWrench);
+                this.updateExternalWrench('right', rightWrench);
             } else {
-                // Clear force display when not in impedance mode
                 this.clearExternalWrench();
             }
         };
@@ -601,28 +621,65 @@ class DigitalTwinApp {
         ['fk-torque-x','fk-torque-y','fk-torque-z','fk-torque-mag'].forEach(id => {
             const el = document.getElementById(id); if (el) el.textContent = '0.00';
         });
-        if (this.forceArrow) this.forceArrow.visible = false;
-        if (this.torqueArrow) this.torqueArrow.visible = false;
+        Object.values(this.forceArrows).forEach((arrow) => {
+            if (arrow) arrow.visible = false;
+        });
+        Object.values(this.torqueArrows).forEach((arrow) => {
+            if (arrow) arrow.visible = false;
+        });
     }
 
     /**
-     * Process external wrench data: update display + 3D arrows
+     * Process a six-dimensional wrench and update force/moment displays.
      * @param {number[]} wrench - [Fx, Fy, Fz, Mx, My, Mz]
      */
-    updateExternalWrench(wrench) {
-        if (!wrench || wrench.length < 6) return;
+    updateExternalWrench(side, wrench) {
+        // Keep the old one-argument call working as a left-arm update.
+        if (Array.isArray(side)) {
+            wrench = side;
+            side = 'left';
+        }
+        if (!Array.isArray(wrench) || wrench.length < 6) return;
+        this.updateExternalForce(side, wrench.slice(0, 3));
+        this.updateExternalMoment(side, wrench.slice(3, 6));
+    }
 
-        const [Fx, Fy, Fz, Mx, My, Mz] = wrench;
-        const forceMag = Math.sqrt(Fx * Fx + Fy * Fy + Fz * Fz);
-        const torqueMag = Math.sqrt(Mx * Mx + My * My + Mz * Mz);
+    /**
+     * Update one arm's external end-effector force.
+     * @param {'left'|'right'} side
+     * @param {number[]} force - [Fx, Fy, Fz] in N
+     */
+    updateExternalForce(side, force) {
+        if (!Array.isArray(force) || force.length < 3) return;
+        const values = force.slice(0, 3).map(Number);
+        if (!values.every(Number.isFinite)) return;
 
-        // Update numeric displays
-        this.updateForceDisplay(Fx, Fy, Fz, forceMag);
-        this.updateTorqueDisplay(Mx, My, Mz, torqueMag);
+        const [Fx, Fy, Fz] = values;
+        const magnitude = Math.sqrt(Fx * Fx + Fy * Fy + Fz * Fz);
+        if (side === 'left') {
+            this.updateForceDisplay(Fx, Fy, Fz, magnitude);
+        }
+        this.updateForceArrow(side, Fx, Fy, Fz, magnitude);
+    }
 
-        // Update 3D arrows
-        this.updateForceArrow(Fx, Fy, Fz, forceMag);
-        this.updateTorqueArrow(Mx, My, Mz, torqueMag);
+    /**
+     * Update one arm's external end-effector moment.
+     * @param {'left'|'right'} side
+     * @param {number[]} moment - [Mx, My, Mz] in Nm
+     */
+    updateExternalMoment(side, moment) {
+        if (!Array.isArray(moment) || moment.length < 3) {
+            return;
+        }
+        const values = moment.slice(0, 3).map(Number);
+        if (!values.every(Number.isFinite)) return;
+
+        const [Mx, My, Mz] = values;
+        const magnitude = Math.sqrt(Mx * Mx + My * My + Mz * Mz);
+        if (side === 'left') {
+            this.updateTorqueDisplay(Mx, My, Mz, magnitude);
+        }
+        this.updateTorqueArrow(side, Mx, My, Mz, magnitude);
     }
 
     /**
@@ -731,51 +788,67 @@ class DigitalTwinApp {
     /**
      * Create or update force arrow (orange→red gradient)
      */
-    updateForceArrow(Fx, Fy, Fz, mag) {
-        if (!this.endEffectorMarker) return;
-
+    updateForceArrow(side, Fx, Fy, Fz, mag) {
+        const marker = this.endEffectorMarkers[side] || (
+            side === 'left' ? this.endEffectorMarker : null
+        );
         if (mag < this.FORCE_THRESHOLD) {
-            if (this.forceArrow) this.forceArrow.visible = false;
+            const oldArrow = this.forceArrows[side];
+            if (oldArrow) oldArrow.visible = false;
             return;
         }
 
         // Robot frame (Z-up) → THREE.js scene (Y-up), negated
         const dir = new THREE.Vector3(-Fx, -Fz, Fy).normalize();
-        const length = mag * this.FORCE_SCALE;
+        const length = Math.min(
+            this.MAX_WRENCH_ARROW_LENGTH,
+            Math.max(this.FORCE_MIN_LENGTH, mag * this.FORCE_SCALE)
+        );
         const color = this._lerpColor(0xff8800, 0xff2200, Math.min(mag / 10, 1));
 
-        if (!this.forceArrow) {
-            this.forceArrow = this._createArrowGroup();
-            this.forceArrow.userData.isForceArrow = true;
-            this.sceneManager.scene.add(this.forceArrow);
+        if (!this.forceArrows[side]) {
+            this.forceArrows[side] = this._createArrowGroup();
+            this.forceArrows[side].userData.isForceArrow = true;
+            this.forceArrows[side].userData.armSide = side;
+            this.sceneManager.scene.add(this.forceArrows[side]);
         }
 
-        this._updateArrowGroup(this.forceArrow, dir, length, color);
+        this._updateArrowGroup(this.forceArrows[side], dir, length, color);
+        if (marker) this.forceArrows[side].position.copy(marker.position);
+        if (side === 'left') this.forceArrow = this.forceArrows[side];
     }
 
     /**
      * Create or update torque arrow (cyan→blue gradient)
      */
-    updateTorqueArrow(Mx, My, Mz, mag) {
-        if (!this.endEffectorMarker) return;
-
+    updateTorqueArrow(side, Mx, My, Mz, mag) {
+        const marker = this.endEffectorMarkers[side] || (
+            side === 'left' ? this.endEffectorMarker : null
+        );
         if (mag < this.TORQUE_THRESHOLD) {
-            if (this.torqueArrow) this.torqueArrow.visible = false;
+            const oldArrow = this.torqueArrows[side];
+            if (oldArrow) oldArrow.visible = false;
             return;
         }
 
         // Robot frame (Z-up) → THREE.js scene (Y-up), negated
         const dir = new THREE.Vector3(-Mx, -Mz, My).normalize();
-        const length = mag * this.TORQUE_SCALE;
+        const length = Math.min(
+            this.MAX_WRENCH_ARROW_LENGTH,
+            Math.max(this.TORQUE_MIN_LENGTH, mag * this.TORQUE_SCALE)
+        );
         const color = this._lerpColor(0x44ddff, 0x2244ff, Math.min(mag / 5, 1));
 
-        if (!this.torqueArrow) {
-            this.torqueArrow = this._createArrowGroup();
-            this.torqueArrow.userData.isTorqueArrow = true;
-            this.sceneManager.scene.add(this.torqueArrow);
+        if (!this.torqueArrows[side]) {
+            this.torqueArrows[side] = this._createArrowGroup();
+            this.torqueArrows[side].userData.isTorqueArrow = true;
+            this.torqueArrows[side].userData.armSide = side;
+            this.sceneManager.scene.add(this.torqueArrows[side]);
         }
 
-        this._updateArrowGroup(this.torqueArrow, dir, length, color);
+        this._updateArrowGroup(this.torqueArrows[side], dir, length, color);
+        if (marker) this.torqueArrows[side].position.copy(marker.position);
+        if (side === 'left') this.torqueArrow = this.torqueArrows[side];
     }
 
     /**
@@ -925,60 +998,90 @@ class DigitalTwinApp {
     }
 
     /**
-     * Create the end effector marker (small red sphere)
+     * Create one end-effector marker per arm.
      */
     createEndEffectorMarker() {
-        // Remove existing marker
-        if (this.endEffectorMarker) {
-            if (this.endEffectorMarker.parent) {
-                this.endEffectorMarker.parent.remove(this.endEffectorMarker);
-            }
-            if (this.endEffectorMarker.geometry) this.endEffectorMarker.geometry.dispose();
-            if (this.endEffectorMarker.material) this.endEffectorMarker.material.dispose();
-            this.endEffectorMarker = null;
-        }
-
-        // Remove existing arrows if model is being reloaded
-        if (this.forceArrow) {
-            this.sceneManager.scene.remove(this.forceArrow);
-            this.forceArrow.traverse(c => { if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); });
-            this.forceArrow = null;
-        }
-        if (this.torqueArrow) {
-            this.sceneManager.scene.remove(this.torqueArrow);
-            this.torqueArrow.traverse(c => { if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); });
-            this.torqueArrow = null;
-        }
-
-        // Create small red sphere - render on top to always be visible
-        const geometry = new THREE.SphereGeometry(0.005, 16, 16);  // 5mm radius
-        const material = new THREE.MeshBasicMaterial({
-            color: 0xff0000,
-            depthTest: false,
-            depthWrite: false
+        Object.values(this.endEffectorMarkers).forEach((marker) => {
+            if (!marker) return;
+            if (marker.parent) marker.parent.remove(marker);
+            if (marker.geometry) marker.geometry.dispose();
+            if (marker.material) marker.material.dispose();
+        });
+        Object.values(this.forceArrows).forEach((arrow) => {
+            if (!arrow) return;
+            this.sceneManager.scene.remove(arrow);
+            arrow.traverse((child) => {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) child.material.dispose();
+            });
+        });
+        Object.values(this.torqueArrows).forEach((arrow) => {
+            if (!arrow) return;
+            this.sceneManager.scene.remove(arrow);
+            arrow.traverse((child) => {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) child.material.dispose();
+            });
         });
 
-        this.endEffectorMarker = new THREE.Mesh(geometry, material);
-        this.endEffectorMarker.renderOrder = 999;
-        this.endEffectorMarker.userData.isEndEffectorMarker = true;
+        this.endEffectorMarkers = { left: null, right: null };
+        this.forceArrows = { left: null, right: null };
+        this.torqueArrows = { left: null, right: null };
+        this.endEffectorMarker = null;
+        this.forceArrow = null;
+        this.torqueArrow = null;
 
-        this.sceneManager.scene.add(this.endEffectorMarker);
-        console.log('[DigitalTwin] End effector marker created');
+        const colors = { left: 0xff0000, right: 0xff8800 };
+        for (const side of ['left', 'right']) {
+            const geometry = new THREE.SphereGeometry(0.005, 16, 16);
+            const material = new THREE.MeshBasicMaterial({
+                color: colors[side],
+                depthTest: false,
+                depthWrite: false,
+            });
+            const marker = new THREE.Mesh(geometry, material);
+            marker.renderOrder = 999;
+            marker.userData.isEndEffectorMarker = true;
+            marker.userData.armSide = side;
+            this.endEffectorMarkers[side] = marker;
+            this.sceneManager.scene.add(marker);
+        }
+
+        this.endEffectorMarker = this.endEffectorMarkers.left;
+        console.log('[DigitalTwin] Left/right end-effector markers created');
     }
 
     /**
-     * Find the last link in the kinematic chain (end effector link)
+     * Find the configured end-effector link for one arm.
      */
-    _findEndEffectorLink() {
+    _findEndEffectorLink(side = 'left') {
         if (!this.currentModel || !this.currentModel.links) return null;
 
-        if (this.endEffectorLinkName) {
-            const configuredLink = this.currentModel.links.get(this.endEffectorLinkName);
+        const configuredName = this.endEffectorLinks[side]
+            || (side === 'left' ? this.endEffectorLinkName : null);
+        if (configuredName) {
+            const configuredLink = this.currentModel.links.get(configuredName);
             if (configuredLink && configuredLink.threeObject) return configuredLink;
+            return null;
         }
 
         // Try fixed TCP/tool frames first. Avoid finger links because they move when the gripper opens.
-        for (const name of ['l_joint7_link', 'r_joint7_link', 'tool_link', 'tcp_link', 'ee_link', 'link6', 'Link_6', 'Link6', 'link_6']) {
+        const sidePrefix = side === 'left' ? 'l_' : 'r_';
+        const candidates = [
+            `${sidePrefix}hand_tcp_link`,
+            `${sidePrefix}hand_tcp`,
+            `${sidePrefix}tcp_link`,
+            `${sidePrefix}tool_link`,
+            `${sidePrefix}gripper_link`,
+            'tool_link',
+            'tcp_link',
+            'ee_link',
+            'link6',
+            'Link_6',
+            'Link6',
+            'link_6',
+        ];
+        for (const name of candidates) {
             const link = this.currentModel.links.get(name);
             if (link && link.threeObject) return link;
         }
@@ -999,41 +1102,54 @@ class DigitalTwinApp {
     }
 
     updateEndEffectorMarker() {
-        if (!this.endEffectorMarker || !this.currentModel) return;
+        if (!this.currentModel) return;
 
-        const endEffectorLink = this._findEndEffectorLink();
-        if (!endEffectorLink || !endEffectorLink.threeObject) {
-            if (!this._loggedMissingLink) {
-                console.warn('[DigitalTwin] End effector link not found');
-                this._loggedMissingLink = true;
+        for (const side of ['left', 'right']) {
+            const marker = this.endEffectorMarkers[side];
+            if (!marker) continue;
+
+            const endEffectorLink = this._findEndEffectorLink(side);
+            if (!endEffectorLink || !endEffectorLink.threeObject) {
+                if (!this._loggedMissingLink?.[side]) {
+                    console.warn(`[DigitalTwin] ${side} end-effector link not found`);
+                    this._loggedMissingLink = {
+                        ...(this._loggedMissingLink || {}),
+                        [side]: true,
+                    };
+                }
+                continue;
             }
-            return;
+
+            // The arrow origin is exactly the configured end-effector frame origin.
+            const markerPosition = new THREE.Vector3();
+            endEffectorLink.threeObject.getWorldPosition(markerPosition);
+
+            const worldQuaternion = new THREE.Quaternion();
+            endEffectorLink.threeObject.getWorldQuaternion(worldQuaternion);
+
+            // Keep the legacy fixed tool offset only for generic link6 models.
+            if (endEffectorLink.name === 'link6' &&
+                this.endEffectorMarkerOffset.lengthSq() > 0) {
+                markerPosition.add(
+                    this.endEffectorMarkerOffset.clone().applyQuaternion(worldQuaternion)
+                );
+            }
+
+            marker.position.copy(markerPosition);
+
+            const arrowPosition = markerPosition.clone();
+            if (this.arrowOffset.lengthSq() > 0) {
+                const displayOffset = this.arrowOffset.clone().applyQuaternion(worldQuaternion);
+                arrowPosition.add(displayOffset);
+            }
+            const torqueArrow = this.torqueArrows[side];
+            if (torqueArrow) torqueArrow.position.copy(arrowPosition);
+            const forceArrow = this.forceArrows[side];
+            if (forceArrow) forceArrow.position.copy(arrowPosition);
         }
 
-        // Get world position of end effector link
-        const position = new THREE.Vector3();
-        endEffectorLink.threeObject.getWorldPosition(position);
-
-        // Get world quaternion once (reused for both offsets)
-        const worldQuaternion = new THREE.Quaternion();
-        endEffectorLink.threeObject.getWorldQuaternion(worldQuaternion);
-
-        const markerPosition = position.clone();
-        if (endEffectorLink.name === 'link6' && this.endEffectorMarkerOffset.lengthSq() > 0) {
-            markerPosition.add(this.endEffectorMarkerOffset.clone().applyQuaternion(worldQuaternion));
-        }
-
-        // Marker shows the fixed tool center, not the sliding finger links.
-        this.endEffectorMarker.position.copy(markerPosition);
-
-        const arrowPosition = markerPosition.clone();
-        if (this.arrowOffset.lengthSq() > 0) {
-            const displayOffset = this.arrowOffset.clone().applyQuaternion(worldQuaternion);
-            arrowPosition.add(displayOffset);
-        }
-
-        if (this.forceArrow) this.forceArrow.position.copy(arrowPosition);
-        if (this.torqueArrow) this.torqueArrow.position.copy(arrowPosition);
+        this.endEffectorMarker = this.endEffectorMarkers.left;
+        this.torqueArrow = this.torqueArrows.left;
     }
 }
 
