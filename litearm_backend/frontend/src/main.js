@@ -1,6 +1,6 @@
 /**
  * Digital Twin - Main Application Entry Point
- * Cartesian impedance visualization with force/torque 3D arrows
+ * Cartesian impedance visualization with Panthera-style external force arrows.
  */
 import * as THREE from 'three';
 import * as d3 from 'd3';
@@ -50,18 +50,16 @@ class DigitalTwinApp {
         this.endEffectorMarker = null;  // Backward-compatible alias for left marker
         this.arrowOffset = new THREE.Vector3(0, 0, 0);
 
-        // External force/moment arrows (custom cylinder+cone for thick lines)
+        // Panthera-compatible wrench visualization:
+        // one visible arrow per arm, showing external force only.
         this.forceArrows = { left: null, right: null };
         this.forceArrow = null;  // Backward-compatible alias for left arrow
         this.torqueArrows = { left: null, right: null };
         this.torqueArrow = null;  // Backward-compatible alias for left arrow
         this.FORCE_SCALE = 8e-3;
-        this.TORQUE_SCALE = 5e-2;  // 0.2Nm → 10mm arrow
         this.FORCE_MIN_LENGTH = 0.012;
-        this.TORQUE_MIN_LENGTH = 0.025;
         this.MAX_WRENCH_ARROW_LENGTH = 0.25;
         this.FORCE_THRESHOLD = 0.05;
-        this.TORQUE_THRESHOLD = 0.01;
         this.SHAFT_RADIUS = 0.005;  // 5mm thick shaft
         this.HEAD_LENGTH = 0.020;   // 20mm cone head
         this.HEAD_RADIUS = 0.010;   // 10mm cone radius
@@ -679,7 +677,10 @@ class DigitalTwinApp {
         if (side === 'left') {
             this.updateTorqueDisplay(Mx, My, Mz, magnitude);
         }
-        this.updateTorqueArrow(side, Mx, My, Mz, magnitude);
+        // Keep Panthera's visible-arrow semantics: the 3D arrow shows
+        // external force only. External moment remains available numerically.
+        const oldArrow = this.torqueArrows[side];
+        if (oldArrow) oldArrow.visible = false;
     }
 
     /**
@@ -816,39 +817,6 @@ class DigitalTwinApp {
         this._updateArrowGroup(this.forceArrows[side], dir, length, color);
         if (marker) this.forceArrows[side].position.copy(marker.position);
         if (side === 'left') this.forceArrow = this.forceArrows[side];
-    }
-
-    /**
-     * Create or update torque arrow (cyan→blue gradient)
-     */
-    updateTorqueArrow(side, Mx, My, Mz, mag) {
-        const marker = this.endEffectorMarkers[side] || (
-            side === 'left' ? this.endEffectorMarker : null
-        );
-        if (mag < this.TORQUE_THRESHOLD) {
-            const oldArrow = this.torqueArrows[side];
-            if (oldArrow) oldArrow.visible = false;
-            return;
-        }
-
-        // Robot frame (Z-up) → THREE.js scene (Y-up), negated
-        const dir = new THREE.Vector3(-Mx, -Mz, My).normalize();
-        const length = Math.min(
-            this.MAX_WRENCH_ARROW_LENGTH,
-            Math.max(this.TORQUE_MIN_LENGTH, mag * this.TORQUE_SCALE)
-        );
-        const color = this._lerpColor(0x44ddff, 0x2244ff, Math.min(mag / 5, 1));
-
-        if (!this.torqueArrows[side]) {
-            this.torqueArrows[side] = this._createArrowGroup();
-            this.torqueArrows[side].userData.isTorqueArrow = true;
-            this.torqueArrows[side].userData.armSide = side;
-            this.sceneManager.scene.add(this.torqueArrows[side]);
-        }
-
-        this._updateArrowGroup(this.torqueArrows[side], dir, length, color);
-        if (marker) this.torqueArrows[side].position.copy(marker.position);
-        if (side === 'left') this.torqueArrow = this.torqueArrows[side];
     }
 
     /**

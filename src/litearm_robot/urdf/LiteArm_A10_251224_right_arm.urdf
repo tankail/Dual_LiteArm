@@ -119,4 +119,17 @@
     <axis xyz="0 -1 0" />
     <limit lower="-1.5708" upper="1.5708" effort="10" velocity="10.263" />
   </joint>
+  <!-- Fixed tool chain used as the force/moment reference point. -->
+  <link name="r_gripper_link" />
+  <joint name="r_gripper_joint" type="fixed">
+    <origin xyz="-0.00543 -0.0044713 -0.09023" rpy="0 0 0" />
+    <parent link="r_joint7_link" />
+    <child link="r_gripper_link" />
+  </joint>
+  <link name="r_hand_tcp_link" />
+  <joint name="r_hand_tcp__joint" type="fixed">
+    <origin xyz="0.00543 0.0044713 -0.1075851" rpy="0 0 0" />
+    <parent link="r_gripper_link" />
+    <child link="r_hand_tcp_link" />
+  </joint>
 </robot>

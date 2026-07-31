@@ -302,7 +302,7 @@
      <!-- Define the hand_tcp frame -->
   <link name="l_hand_tcp_link"/>
   <joint name="l_hand_tcp__joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 0.0845"/>
+    <origin rpy="0 0 0" xyz="0 0 -0.1076651"/>
     <parent link="l_gripper_link"/>
     <child link="l_hand_tcp_link"/>
     <dynamics damping="0.02" friction="0.0"/> <!-- 即使很小的阻尼也能极大改善稳定性 -->
@@ -612,7 +612,7 @@
    </joint>
   <link name="r_hand_tcp_link"/>
   <joint name="r_hand_tcp__joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 0.0845"/>
+    <origin rpy="0 0 0" xyz="0.00543 0.0044713 -0.1075851"/>
     <parent link="r_gripper_link"/>
     <child link="r_hand_tcp_link"/>
     <dynamics damping="0.02" friction="0.0"/> <!-- 即使很小的阻尼也能极大改善稳定性 -->
