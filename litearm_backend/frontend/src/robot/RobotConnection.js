@@ -52,10 +52,10 @@ export class RobotConnection {
 
     /**
      * Connect to robot backend server
-     * @param {string} url - Server URL (e.g., 'http://localhost:5001')
+     * @param {string} url - Server URL (e.g., 'http://localhost:5000')
      * @returns {Promise<boolean>}
      */
-    async connect(url = 'http://localhost:5001') {
+    async connect(url = 'http://localhost:5000') {
         return new Promise((resolve, reject) => {
             if (this.socket) {
                 this.disconnect()
@@ -263,7 +263,7 @@ export class RobotConnection {
      * @param {string} url - Server URL
      * @returns {Promise<Object>}
      */
-    async fetchConfig(url = 'http://localhost:5001') {
+    async fetchConfig(url = 'http://localhost:5000') {
         try {
             const response = await fetch(`${url}/api/config`)
             if (!response.ok) throw new Error('Failed to fetch config')

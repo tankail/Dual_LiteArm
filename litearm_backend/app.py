@@ -7,8 +7,8 @@ Drives 4 serial ports (left/right/waist/head) via motor_driver.py.
 Supports live hardware mode and demo (simulated) mode.
 
 Usage:
-    python app.py --config robot_param/litearm_full.yaml --port 5001
-    python app.py --demo --port 5001
+    python app.py --config robot_param/litearm_full.yaml --port 5000
+    python app.py --demo --port 5000
 """
 
 import sys
@@ -2511,7 +2511,7 @@ def main():
                    default='robot_param/litearm_full.yaml',
                    help='Robot config YAML')
     p.add_argument('--demo', action='store_true', help='Demo mode (no hardware)')
-    p.add_argument('--port', type=int, default=5001, help='Server port')
+    p.add_argument('--port', type=int, default=5000, help='Server port')
     args = p.parse_args()
 
     demo_mode = args.demo

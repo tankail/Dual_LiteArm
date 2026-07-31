@@ -5,7 +5,7 @@ ENV_NAME="${LITEARM_ENV_NAME:-panthera}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${ROOT_DIR}/robot_param/litearm_full.yaml"
 MODE="live"
-PORT="5001"
+PORT="5000"
 export LITEARM_SCRIPT_DIR="${LITEARM_SCRIPT_DIR:-${ROOT_DIR}/litearm_python}"
 
 fail() {
