@@ -28,8 +28,8 @@ except ImportError as exc:  # pragma: no cover - depends on active conda env
 
 
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-PROJECT_DIR = os.path.abspath(os.path.join(BACKEND_DIR, ".."))
-TEACH_DIR = os.path.join(PROJECT_DIR, "src", "litearm_robot", "teach")
+# motor_driver.py lives in the same folder as this module (self-contained).
+TEACH_DIR = os.path.abspath(os.path.dirname(__file__))
 if TEACH_DIR not in sys.path:
     sys.path.insert(0, TEACH_DIR)
 

@@ -20,9 +20,7 @@ SCRIPT_DIR = os.path.abspath(
 DEFAULT_CONFIG = os.path.join(
     BACKEND_DIR, "robot_param", "litearm_arms.yaml"
 )
-TEACH_DIR = os.path.normpath(
-    os.path.join(BACKEND_DIR, "..", "src", "litearm_robot", "teach")
-)
+TEACH_DIR = os.path.join(BACKEND_DIR, "litearm_python")
 
 
 def _resolve_script_path(script_name):
@@ -44,7 +42,12 @@ def _available_scripts():
         if (
             filename.endswith(".py")
             and not filename.startswith("__")
-            and filename != "litearm_control.py"
+            and filename
+            not in (
+                "litearm_control.py",
+                "litearm_demo_common.py",
+                "motor_driver.py",
+            )
         )
     )
 

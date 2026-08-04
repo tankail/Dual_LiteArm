@@ -72,8 +72,8 @@ if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
   fail "conda env '${ENV_NAME}' not found. Create it or set LITEARM_ENV_NAME."
 fi
 
-# Add motor_driver.py to PYTHONPATH
-TEACH_DIR="${ROOT_DIR}/../src/litearm_robot/teach"
+# Add motor_driver.py to PYTHONPATH (self-contained in litearm_python/)
+TEACH_DIR="${ROOT_DIR}/litearm_python"
 export PYTHONPATH="${TEACH_DIR}:${PYTHONPATH:-}"
 
 cd "${ROOT_DIR}"

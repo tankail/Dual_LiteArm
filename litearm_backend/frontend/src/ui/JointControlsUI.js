@@ -1012,11 +1012,24 @@ export class JointControlsUI {
                 this.applyJointToModel(model, name, value, true);
             }
         });
+
+        // Keep the whole arm in view while dragging.
+        this.refitPreviewCameraIfOutOfView();
     }
 
     fitPreviewCamera(model) {
         const object3d = model?.previewRoot || model?.threeObject;
         if (!this.previewCamera || !object3d || this.previewCameraLocked) return;
+        this.applyPreviewCameraFit(model, object3d);
+    }
+
+    /**
+     * Fit the preview camera so the whole model is visible (no lock check).
+     * @param {object} model - Preview model
+     * @param {THREE.Object3D} object3d - Preview root object
+     */
+    applyPreviewCameraFit(model, object3d) {
+        if (!this.previewCamera || !object3d) return;
 
         object3d.updateMatrixWorld(true);
         const bbox = new THREE.Box3().setFromObject(object3d);
@@ -1025,15 +1038,113 @@ export class JointControlsUI {
         const size = bbox.getSize(new THREE.Vector3());
         const maxDim = Math.max(size.x, size.y, size.z, 0.1);
         const lookAt = this.getBaseTowardLink1Focus(model, bbox, size);
-
         const distance = maxDim * 1.5;
+
+        this.positionPreviewCamera(lookAt, distance);
+    }
+
+    /**
+     * Containment fit: position the preview camera, then keep pulling it back
+     * along its view direction until every corner of the model's bounding box
+     * is inside the view. Used while a joint is being dragged so the arm is
+     * never cut off at the canvas edge.
+     * @param {THREE.Object3D} object3d - Preview root object
+     */
+    containPreviewCameraFit(object3d) {
+        if (!this.previewCamera || !object3d) return;
+
+        object3d.updateMatrixWorld(true);
+        const bbox = new THREE.Box3().setFromObject(object3d);
+        if (bbox.isEmpty()) return;
+
+        const size = bbox.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z, 0.1);
+        // Center the arm in the preview so it fills the view while staying
+        // fully visible (a low lookAt point would force the camera very far
+        // back to contain a tall extended arm).
+        const lookAt = bbox.getCenter(new THREE.Vector3());
         const direction = new THREE.Vector3(1.35, 1.0, 1.2).normalize();
 
-        this.previewCamera.position.copy(lookAt).add(direction.multiplyScalar(distance));
+        const { min, max } = bbox;
+        const corners = [
+            new THREE.Vector3(min.x, min.y, min.z), new THREE.Vector3(max.x, min.y, min.z),
+            new THREE.Vector3(min.x, max.y, min.z), new THREE.Vector3(max.x, max.y, min.z),
+            new THREE.Vector3(min.x, min.y, max.z), new THREE.Vector3(max.x, min.y, max.z),
+            new THREE.Vector3(min.x, max.y, max.z), new THREE.Vector3(max.x, max.y, max.z)
+        ];
+
+        const cam = this.previewCamera;
+        const tmpPos = new THREE.Vector3();
+        const projScreen = new THREE.Matrix4();
+        const frustum = new THREE.Frustum();
+
+        // Start from the standard framing distance and pull back until the
+        // whole model fits inside the view.
+        let distance = maxDim * 1.5;
+        for (let i = 0; i < 8; i++) {
+            tmpPos.copy(lookAt).addScaledVector(direction, distance);
+            cam.position.copy(tmpPos);
+            cam.lookAt(lookAt);
+            cam.updateMatrixWorld(true);
+            cam.matrixWorldInverse.copy(cam.matrixWorld).invert();
+            projScreen.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+            frustum.setFromProjectionMatrix(projScreen);
+            if (corners.every(c => frustum.containsPoint(c))) break;
+            distance *= 1.35;
+        }
+
+        this.positionPreviewCamera(lookAt, distance);
+    }
+
+    /**
+     * Point the preview camera at lookAt from a given distance and refresh its
+     * near/far planes.
+     * @param {THREE.Vector3} lookAt - Camera target
+     * @param {number} distance - Distance from lookAt to the camera
+     */
+    positionPreviewCamera(lookAt, distance) {
+        const direction = new THREE.Vector3(1.35, 1.0, 1.2).normalize();
+        this.previewCamera.position.copy(lookAt).addScaledVector(direction, distance);
         this.previewCamera.near = Math.max(distance / 100, 0.01);
         this.previewCamera.far = distance * 100;
         this.previewCamera.lookAt(lookAt);
         this.previewCamera.updateProjectionMatrix();
+    }
+
+    /**
+     * While a joint is being dragged, re-fit the preview camera if any part of
+     * the arm has moved outside the preview view. Otherwise the arm would be
+     * cut off at the canvas edge as joints rotate.
+     */
+    refitPreviewCameraIfOutOfView() {
+        if (!this.previewCamera || !this.previewModel) return;
+
+        const object3d = this.previewModel.previewRoot || this.previewModel.threeObject;
+        object3d.updateMatrixWorld(true);
+        const bbox = new THREE.Box3().setFromObject(object3d);
+        if (bbox.isEmpty()) return;
+
+        // Make sure the camera matrices are current before testing the frustum.
+        this.previewCamera.updateMatrixWorld(true);
+        this.previewCamera.matrixWorldInverse.copy(this.previewCamera.matrixWorld).invert();
+
+        const projScreen = new THREE.Matrix4().multiplyMatrices(
+            this.previewCamera.projectionMatrix,
+            this.previewCamera.matrixWorldInverse
+        );
+        const frustum = new THREE.Frustum().setFromProjectionMatrix(projScreen);
+
+        const { min, max } = bbox;
+        const corners = [
+            new THREE.Vector3(min.x, min.y, min.z), new THREE.Vector3(max.x, min.y, min.z),
+            new THREE.Vector3(min.x, max.y, min.z), new THREE.Vector3(max.x, max.y, min.z),
+            new THREE.Vector3(min.x, min.y, max.z), new THREE.Vector3(max.x, min.y, max.z),
+            new THREE.Vector3(min.x, max.y, max.z), new THREE.Vector3(max.x, max.y, max.z)
+        ];
+
+        if (corners.some(c => !frustum.containsPoint(c))) {
+            this.containPreviewCameraFit(object3d);
+        }
     }
 
     getBaseTowardLink1Focus(model, bbox, size) {

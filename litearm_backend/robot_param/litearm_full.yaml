@@ -82,9 +82,9 @@ motor_types:
   "/dev/ttyACM2": ["NONE", "NONE"]
   "/dev/ttyACM3": ["NONE", "NONE"]
 
-# ── URDF / FK ──
+# ── URDF / FK (self-contained: ../urdf resolves to litearm_backend/urdf) ──
 urdf:
-  file_path: "../../src/litearm_a10_251125/urdf/LiteArm_A10_251125.urdf"
+  file_path: "../urdf/LiteArm_A10_251125.urdf"
 
 # ── 控制参数 ──
 control:

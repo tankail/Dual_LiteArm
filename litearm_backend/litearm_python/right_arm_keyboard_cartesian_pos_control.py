@@ -12,8 +12,8 @@ import numpy as np
 from litearm_control import DEFAULT_CONFIG, DualLiteArmPython
 
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
-DEMO_SCRIPT_DIR = PROJECT_DIR / "src" / "litearm_robot" / "scripts"
+# litearm_demo_common.py lives in the same folder (self-contained).
+DEMO_SCRIPT_DIR = Path(__file__).resolve().parent
 if str(DEMO_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_SCRIPT_DIR))
 

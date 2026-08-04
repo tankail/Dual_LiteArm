@@ -25,15 +25,11 @@ import signal
 import numpy as np
 from serial.tools import list_ports
 
-# ── Path setup: find motor_driver.py ───────────────────────────
+# ── Path setup: find motor_driver.py (self-contained in litearm_python/) ──
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-TEACH_DIR = os.path.normpath(os.path.join(BACKEND_DIR, '..', 'src', 'litearm_robot', 'teach'))
+TEACH_DIR = os.path.join(BACKEND_DIR, 'litearm_python')
 if TEACH_DIR not in sys.path:
     sys.path.insert(0, TEACH_DIR)
-DEMO_SCRIPT_DIR = os.path.normpath(os.path.join(
-    BACKEND_DIR, '..', 'src', 'litearm_robot', 'scripts'))
-if DEMO_SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, DEMO_SCRIPT_DIR)
 
 from motor_driver import MultiMotorManager, MotorState, rad_to_deg, deg_to_rad
 
@@ -1471,7 +1467,8 @@ def _discover_scripts():
     for filename in sorted(os.listdir(SCRIPT_DIR)):
         if not filename.endswith('.py') or filename.startswith('__'):
             continue
-        if filename in ('litearm_demo_common.py', 'litearm_control.py'):
+        if filename in ('litearm_demo_common.py', 'litearm_control.py',
+                        'motor_driver.py'):
             continue
         full_path = os.path.join(SCRIPT_DIR, filename)
         if not os.path.isfile(full_path):
@@ -2044,9 +2041,8 @@ def api_get_mode():
     return jsonify({'mode': control_mode})
 
 
-# ── URDF / Mesh file serving ──────────────────────────────────
-ARM_DESC_DIR = os.path.normpath(os.path.join(
-    BACKEND_DIR, '..', 'src', 'litearm_a10_251125'))
+# ── URDF / Mesh file serving (self-contained in urdf/) ─────────
+ARM_DESC_DIR = os.path.join(BACKEND_DIR, 'urdf')
 
 
 @app.route('/arm_description/<path:filepath>')
@@ -2059,7 +2055,7 @@ def serve_arm_file(filepath):
 def api_urdf_path():
     """Return the URDF file path for the frontend to load."""
     return jsonify({
-        'urdf_url': '/arm_description/urdf/LiteArm_A10_251125.urdf',
+        'urdf_url': '/arm_description/LiteArm_A10_251125.urdf',
         'mesh_package': 'package://litearm_a10_251125',
         'mesh_prefix': '/arm_description',
     })

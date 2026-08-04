@@ -61,11 +61,11 @@ motor_types:
   "/dev/ttyACM0": ["7256_35", "7256_35", "6056_36", "6056_36", "4438_30", "5047_36", "4438_30", "4438_30"]
   "/dev/ttyACM1": ["7256_35", "7256_35", "6056_36", "6056_36", "4438_30", "5047_36", "4438_30", "4438_30"]
 
-# ── URDF / FK ──
+# ── URDF / FK (self-contained: ../urdf resolves to litearm_backend/urdf) ──
 urdf:
-  file_path: "../../src/litearm_a10_251125/urdf/LiteArm_A10_251125.urdf"
-  left_arm: "../../src/litearm_robot/urdf/LiteArm_A10_251224_left_arm.urdf"
-  right_arm: "../../src/litearm_robot/urdf/LiteArm_A10_251224_right_arm.urdf"
+  file_path: "../urdf/LiteArm_A10_251125.urdf"
+  left_arm: "../urdf/LiteArm_A10_251224_left_arm.urdf"
+  right_arm: "../urdf/LiteArm_A10_251224_right_arm.urdf"
 
 # ── 控制参数 ──
 control:

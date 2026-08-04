@@ -20,42 +20,40 @@
 
 ## 1. 工程目录要求
 
-需要把整个 `Dual_LiteArm` 工程复制到新电脑，不能只复制
-`litearm_backend` 目录。目录结构至少应保持如下形式：
+从 2026-08 起，`litearm_backend` 已改为**自包含**结构，不再依赖上一级的
+`src/` 目录。部署时只需复制 `litearm_backend` 整个目录即可：
 
 ```text
-Dual_LiteArm/
-├── litearm_backend/
-│   ├── app.py
-│   ├── backend.sh
-│   ├── backend_arms.sh
-│   ├── frontend/
-│   ├── litearm_python/
-│   └── robot_param/
-└── src/
-    ├── litearm_robot/
-    │   ├── teach/
-    │   │   └── motor_driver.py
-    │   └── urdf/
-    │       ├── LiteArm_A10_251224_left_arm.urdf
-    │       └── LiteArm_A10_251224_right_arm.urdf
-    └── litearm_a10_251125/
-        └── urdf/
-            └── LiteArm_A10_251125.urdf
+litearm_backend/
+├── app.py
+├── backend.sh
+├── backend_arms.sh
+├── frontend/
+├── litearm_python/           # 控制脚本 + motor_driver.py + litearm_demo_common.py
+│   ├── motor_driver.py
+│   └── litearm_demo_common.py
+├── robot_param/
+│   ├── litearm_arms.yaml
+│   └── litearm_full.yaml
+├── urdf/                     # 上位机自带的 URDF 和网格
+│   ├── LiteArm_A10_251125.urdf
+│   ├── LiteArm_A10_251224_left_arm.urdf
+│   ├── LiteArm_A10_251224_right_arm.urdf
+│   └── litearm_a10_251125/meshes/   # 3D 查看器用的 STL 网格
+└── run_script.py
 ```
 
-`backend.sh` 会把以下目录加入 Python 模块搜索路径：
+后端用到的所有外部资源（URDF、网格、`motor_driver.py`、
+`litearm_demo_common.py`）都已复制到 `litearm_backend` 内部：
 
-```text
-Dual_LiteArm/src/litearm_robot/teach
-```
+- `motor_driver.py` 位于 `litearm_python/`，`app.py`、`backend.sh`、
+  `run_script.py` 都通过 `litearm_backend/litearm_python` 找到它。
+- URDF 路径在 `robot_param/*.yaml` 中写成 `../urdf/...`，相对配置文件所在
+  目录（`litearm_backend/robot_param`）解析，即指向 `litearm_backend/urdf/`。
 
-`robot_param/litearm_arms.yaml` 中的 URDF 路径也是相对于
-`litearm_backend/robot_param` 的相对路径。因此，`litearm_backend` 和
-`src` 必须是同级目录。
-
-如果工程放在其他位置，直接修改 `Dual_LiteArm` 的父目录即可，不需要把
-路径硬编码为 `/home/tk`。运行时脚本会根据自身位置计算 `ROOT_DIR`。
+因此整个 `litearm_backend` 目录可以整体复制到任意位置（不要求与 `src`
+同级，也不要求放在 `/home/tk`）。运行时脚本会根据自身位置计算
+`ROOT_DIR`。
 
 ## 2. 操作系统软件
 
@@ -231,9 +229,10 @@ bash -n backend_arms.sh
 
 test -f app.py
 test -f robot_param/litearm_arms.yaml
-test -f ../src/litearm_robot/teach/motor_driver.py
-test -f ../src/litearm_robot/urdf/LiteArm_A10_251224_left_arm.urdf
-test -f ../src/litearm_robot/urdf/LiteArm_A10_251224_right_arm.urdf
+test -f litearm_python/motor_driver.py
+test -f urdf/LiteArm_A10_251125.urdf
+test -f urdf/LiteArm_A10_251224_left_arm.urdf
+test -f urdf/LiteArm_A10_251224_right_arm.urdf
 ```
 
 检查 Python 文件是否存在语法问题：
@@ -451,15 +450,17 @@ fuser -v /dev/ttyACM0 /dev/ttyACM1
 
 ### 11.5 找不到 URDF 或 `motor_driver.py`
 
-检查目录是否为：
+确认以下文件存在于 `litearm_backend` 内部：
 
 ```text
-Dual_LiteArm/litearm_backend/
-Dual_LiteArm/src/
+litearm_backend/litearm_python/motor_driver.py
+litearm_backend/urdf/LiteArm_A10_251125.urdf
+litearm_backend/urdf/LiteArm_A10_251224_left_arm.urdf
+litearm_backend/urdf/LiteArm_A10_251224_right_arm.urdf
 ```
 
-不要把 `src` 放到 `litearm_backend/src`，也不要只复制
-`litearm_backend` 而遗漏上一级的 `src`。
+这些文件已随 `litearm_backend` 自包含。如果缺失，说明复制 `litearm_backend`
+时遗漏了 `urdf/` 目录或 `litearm_python/motor_driver.py`。
 
 ### 11.6 页面空白或仍然显示旧版本
 
@@ -492,7 +493,7 @@ Ctrl+Shift+R
 新电脑上建议严格按下面顺序执行：
 
 ```bash
-# 1. 复制完整工程，确认 litearm_backend 和 src 同级
+# 1. 复制 litearm_backend 目录（已自包含，无需上一级 src）
 
 # 2. 创建 Conda 环境
 conda create -n panthera python=3.10 -y
